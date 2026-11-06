@@ -390,7 +390,8 @@ function createApp(config) {
                     : [];
             const overrides = {};
             ids.forEach((id) => {
-                overrides[id] = false;
+                /* opencode>=1.19 + zen 免费模型下, 禁用 read/glob 任一会导致 prompt 请求永久挂起, 这两个只读工具保持启用, 其余工具仍禁用 */
+                overrides[id] = ["read","glob"].includes(String(id).toLowerCase()) ? true : false;
             });
             cachedToolOverrides = overrides;
             cachedToolAt = Date.now();
@@ -514,8 +515,14 @@ function createApp(config) {
             (async () => {
                 try {
                     for await (const event of eventStream) {
-                        if (event.type === 'message.part.updated' && event.properties.part.sessionID === sessionId) {
-                            const { part, delta } = event.properties;
+                        if (event.type === 'message.part.updated' && ((event.properties.part && event.properties.part.sessionID) || event.properties.sessionID) === sessionId) {
+                            const { part } = event.properties;
+                            /* opencode>=1.19 事件无 delta 字段, part.text 是该 part 当前全量文本, 按已累积内容差量化出增量 */
+                            let delta = event.properties.delta;
+                            if (!delta && (part.type === 'text' || part.type === 'reasoning') && typeof part.text === 'string') {
+                                const acc = part.type === 'reasoning' ? reasoning : content;
+                                delta = part.text.startsWith(acc) ? part.text.slice(acc.length) : part.text;
+                            }
                             if (delta) {
                                 receivedDelta = true;
                                 if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
@@ -765,9 +772,13 @@ function createApp(config) {
                             }
                         }
 
-                        if (collected && !streamedContent && !streamedReasoning && (collected.reasoning || collected.content)) {
-                            if (collected.reasoning) sendDelta(collected.reasoning, true);
-                            if (collected.content) sendDelta(collected.content, false);
+                        /* opencode>=1.19 SSE delta 缺失时 assistant 快速 finish 会带空内容提前 resolve, 这里兜底轮询一次取完整回复再下发, 轮询也无内容则不发任何 delta */
+                        if (collected && !streamedContent && !streamedReasoning) {
+                            const { content: polledContent, reasoning: polledReasoning } = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                            const safePolledReasoning = stripFunctionCalls(polledReasoning, false);
+                            const safePolledContent = stripFunctionCalls(polledContent, false);
+                            if (safePolledReasoning) sendDelta(safePolledReasoning, true);
+                            if (safePolledContent) sendDelta(safePolledContent, false);
                         }
 
                         res.write(`data: ${JSON.stringify({ id, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
