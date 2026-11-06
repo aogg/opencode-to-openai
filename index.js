@@ -1,4 +1,5 @@
 import { startProxy } from './src/proxy.js';
+import { logger } from './src/logger.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -18,6 +19,7 @@ function parseBool(value, fallback) {
 }
 
 // Default configuration
+// LOG_LEVEL 不在此声明默认值: 未显式配置时传 undefined 交给 startProxy 兜底(默认 info + 旧 DEBUG 开关联动)
 const defaultConfig = {
     PORT: 8083,
     API_KEY: '',
@@ -36,13 +38,14 @@ if (fs.existsSync(configPath)) {
     try {
         const content = fs.readFileSync(configPath, 'utf8');
         fileConfig = JSON.parse(content);
-        console.log('[Config] Loaded from config.json');
+        logger.info('[Config] Loaded from config.json');
     } catch (err) {
-        console.error('[Config] Error parsing config.json:', err.message);
+        logger.error('[Config] Error parsing config.json:', { error: err.message });
     }
 }
 
 // Merge configs: env > file > default
+// 注: LOG_LEVEL 特例按需求为 env 优先于 config.json 的 logLevel 字段(与下方其他键的合并方向一致, 均为 env 在前)
 const finalConfig = {
     PORT: parseInt(process.env.PORT) || fileConfig.PORT || defaultConfig.PORT,
     API_KEY: process.env.API_KEY || fileConfig.API_KEY || defaultConfig.API_KEY,
@@ -50,12 +53,15 @@ const finalConfig = {
     OPENCODE_BIND_HOST: process.env.OPENCODE_BIND_HOST || fileConfig.OPENCODE_BIND_HOST || defaultConfig.OPENCODE_BIND_HOST,
     OPENCODE_PATH: process.env.OPENCODE_PATH || fileConfig.OPENCODE_PATH || defaultConfig.OPENCODE_PATH,
     BIND_HOST: process.env.BIND_HOST || fileConfig.BIND_HOST || defaultConfig.BIND_HOST,
-    DISABLE_TOOLS: parseBool(process.env.OPENCODE_DISABLE_TOOLS, parseBool(fileConfig.DISABLE_TOOLS, defaultConfig.DISABLE_TOOLS))
+    DISABLE_TOOLS: parseBool(process.env.OPENCODE_DISABLE_TOOLS, parseBool(fileConfig.DISABLE_TOOLS, defaultConfig.DISABLE_TOOLS)),
+    // LOG_LEVEL: env 优先于 config.json; 均未显式设置时传 undefined,
+    // 由 startProxy 兜底默认 info 并保留旧 DEBUG 开关 -> debug 等级的联动
+    LOG_LEVEL: process.env.LOG_LEVEL || fileConfig.LOG_LEVEL || undefined
 };
 
 // Validate required configuration
 if (!finalConfig.OPENCODE_PATH) {
-    console.error('[Error] OPENCODE_PATH is not set. Please configure it in config.json or environment variable.');
+    logger.error('[Error] OPENCODE_PATH is not set. Please configure it in config.json or environment variable.');
     process.exit(1);
 }
 
@@ -64,22 +70,23 @@ import { execSync } from 'child_process';
 try {
     execSync(`"${finalConfig.OPENCODE_PATH}" --version`, { stdio: 'ignore' });
 } catch (e) {
-    console.warn(`[Warning] Cannot verify OpenCode installation: ${finalConfig.OPENCODE_PATH}`);
-    console.warn('[Warning] Please ensure OpenCode is installed:');
-    console.warn('  Windows: npm install -g opencode-ai');
-    console.warn('  Linux/macOS: curl -fsSL https://opencode.ai/install | bash');
-    console.warn('[Warning] Or specify the full path in config.json:');
-    console.warn('  { "OPENCODE_PATH": "C:\\\\Users\\\\YourName\\\\AppData\\\\Roaming\\\\npm\\\\opencode.cmd" }');
+    logger.warn(`[Warning] Cannot verify OpenCode installation: ${finalConfig.OPENCODE_PATH}`);
+    logger.warn('[Warning] Please ensure OpenCode is installed:');
+    logger.warn('  Windows: npm install -g opencode-ai');
+    logger.warn('  Linux/macOS: curl -fsSL https://opencode.ai/install | bash');
+    logger.warn('[Warning] Or specify the full path in config.json:');
+    logger.warn('  { "OPENCODE_PATH": "C:\\\\Users\\\\YourName\\\\AppData\\\\Roaming\\\\npm\\\\opencode.cmd" }');
 }
 
-console.log('[Config] Starting with configuration:');
-console.log(`  - Port: ${finalConfig.PORT}`);
-console.log(`  - Bind Host: ${finalConfig.BIND_HOST}`);
-console.log(`  - Backend: ${finalConfig.OPENCODE_SERVER_URL}`);
-console.log(`  - Bind Host for OpenCode backend: ${finalConfig.OPENCODE_BIND_HOST}`);
-console.log(`  - OpenCode Path: ${finalConfig.OPENCODE_PATH}`);
-console.log(`  - API Key: ${finalConfig.API_KEY ? 'Configured' : 'Not configured (no auth)'}`);
-console.log(`  - Disable Tools: ${finalConfig.DISABLE_TOOLS ? 'Yes' : 'No'}`);
+logger.info('[Config] Starting with configuration:');
+logger.info(`  - Port: ${finalConfig.PORT}`);
+logger.info(`  - Bind Host: ${finalConfig.BIND_HOST}`);
+logger.info(`  - Backend: ${finalConfig.OPENCODE_SERVER_URL}`);
+logger.info(`  - Bind Host for OpenCode backend: ${finalConfig.OPENCODE_BIND_HOST}`);
+logger.info(`  - OpenCode Path: ${finalConfig.OPENCODE_PATH}`);
+logger.info(`  - API Key: ${finalConfig.API_KEY ? 'Configured' : 'Not configured (no auth)'}`);
+logger.info(`  - Disable Tools: ${finalConfig.DISABLE_TOOLS ? 'Yes' : 'No'}`);
+logger.info(`  - Log Level (requested): ${finalConfig.LOG_LEVEL || 'info (default)'}`);
 
 // Start the proxy
 try {
@@ -87,23 +94,23 @@ try {
     
     // Handle graceful shutdown
     process.on('SIGINT', () => {
-        console.log('\n[Shutdown] Received SIGINT, shutting down gracefully...');
+        logger.info('[Shutdown] Received SIGINT, shutting down gracefully...');
         proxy.killBackend();
         proxy.server.close(() => {
-            console.log('[Shutdown] Server closed');
+            logger.info('[Shutdown] Server closed');
             process.exit(0);
         });
     });
-    
+
     process.on('SIGTERM', () => {
-        console.log('\n[Shutdown] Received SIGTERM, shutting down gracefully...');
+        logger.info('[Shutdown] Received SIGTERM, shutting down gracefully...');
         proxy.killBackend();
         proxy.server.close(() => {
-            console.log('[Shutdown] Server closed');
+            logger.info('[Shutdown] Server closed');
             process.exit(0);
         });
     });
 } catch (error) {
-    console.error('[Fatal] Failed to start proxy:', error.message);
+    logger.error('[Fatal] Failed to start proxy:', { error: error.message, stack: error.stack });
     process.exit(1);
 }

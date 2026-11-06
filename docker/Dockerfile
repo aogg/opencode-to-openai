@@ -43,6 +43,14 @@ RUN chmod +x /app/docker-entrypoint.sh
 # 网关监听端口(与 docker-entrypoint.sh 生成的 config.json 默认 PORT 一致)
 EXPOSE 8083
 
+# 日志等级声明(默认 info, 可选 error/warn/info/debug, 不区分大小写, 非法值回退 info 并告警):
+# docker run -e LOG_LEVEL=debug 覆盖此默认值; LOG_LEVEL 由 node 进程直读环境变量,
+# 优先级高于 config.json 里的 LOG_LEVEL 字段(env 优先)。级别越高日志越细:
+#   info: 启动信息 + 每个请求一行摘要(方法/路径/模型/流式/状态码/耗时/请求id)
+#   debug: 额外输出转发给 opencode 的最终请求体、完整响应(非流式 JSON/流式 SSE 结束汇总)
+#   error: 上游(4097)请求失败/错误必输出, 含状态码与错误体摘要
+ENV LOG_LEVEL=info
+
 # opencode serve 后端端口(4097)
 # 仅当 OPENCODE_BIND_HOST=0.0.0.0(容器内 -e 生成配置时的默认)且 docker run 带 -p 4097:4097 时才对外可达;
 # 网关自身始终经 OPENCODE_SERVER_URL(默认 http://127.0.0.1:4097)访问后端, 不受该变量影响

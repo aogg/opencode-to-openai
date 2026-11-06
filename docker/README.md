@@ -84,6 +84,7 @@ curl -X POST http://127.0.0.1:8083/v1/chat/completions \
 | `OPENCODE_PATH` | 空(自动探测) | opencode 可执行文件路径;留空时按 PATH 查找(npm 全局安装在 `/usr/local/bin/opencode`),程序还会自动探测 `~/.opencode/bin`、npm/pnpm 全局目录 |
 | `OPENCODE_SERVER_URL` | `http://127.0.0.1:4097` | 网关内部自动拉起的 opencode 后端服务地址,一般不用改 |
 | `OPENCODE_BIND_HOST` | `0.0.0.0` | opencode 后端(4097)监听地址,容器内默认 `0.0.0.0`;程序内置默认 `127.0.0.1`(非容器场景行为不变),详见下方「4097 后端端口对外访问」 |
+| `LOG_LEVEL` | `info` | 日志等级,可选 `error`/`warn`/`info`/`debug`(不区分大小写,非法值回退 `info` 并告警)。**特例:不走 config.json,由 node 进程直读环境变量,env 优先于 config.json 里的 `LOG_LEVEL` 字段**,详见下方「日志等级与请求日志」 |
 
 示例(开启鉴权):
 
@@ -96,8 +97,50 @@ docker run -d --restart=always --network common-all --name opencode-to-openai --
 配置生效规则:
 
 - `-e` 只在**首次启动**生成 config.json 时读取;`/app/config.json` 已存在时直接使用、**不被 `-e` 覆盖**(如 `-v` 挂载持久化的配置,优先于 `-e`)
+- **特例:`LOG_LEVEL` 不写入 config.json**,由 node 进程直读环境变量,`docker run -e LOG_LEVEL=...` 每次启动都生效(优先级 env > config.json 的 `LOG_LEVEL` 字段 > 默认 `info`)
 - 想用新的 `-e` 重新生成:删掉挂载的 config.json 文件(或去掉 `-v` 挂载)后重建容器即可
-- 程序运行时读取优先级为 **config.json > 带 `OPENCODE_` 前缀的程序内置环境变量(如 `OPENCODE_DISABLE_TOOLS`) > 程序内置默认**,所以上面 `-e` 生成的 config.json 是最终生效配置
+- 程序运行时读取优先级为 **config.json > 带 `OPENCODE_` 前缀的程序内置环境变量(如 `OPENCODE_DISABLE_TOOLS`) > 程序内置默认**,所以上面 `-e` 生成的 config.json 是最终生效配置(`LOG_LEVEL` 除外,见上)
+
+### 日志等级与请求日志
+
+所有日志走 stdout/stderr(`docker logs` 可见),统一带 `[gateway]` 前缀,格式:`[gateway] <ISO时间> [LEVEL] 消息 {"detail":"json"}`。`error`/`warn` 走 stderr,`info`/`debug` 走 stdout。
+
+用 `docker run -e LOG_LEVEL=<等级>` 控制(不区分大小写;非法值回退 `info` 并输出告警;镜像内置默认 `info`):
+
+```bash
+docker run -d --restart=always --name opencode-to-openai -p 8083:8083 -e LOG_LEVEL=debug adockero/opencode-to-openai
+```
+
+各等级输出内容:
+
+| 等级 | 输出内容 |
+|------|---------|
+| `error` | 上游(opencode serve,4097)请求失败/错误(含状态码与错误体摘要,恒输出)、启动致命问题 |
+| `warn` | 非法 LOG_LEVEL 回退告警、可自动恢复的异常 |
+| `info`(默认) | 启动信息(含当前生效日志等级)、**每个 OpenAI 兼容请求一行摘要**:方法、路径、模型、流式与否、响应状态码、耗时 ms、请求 id(同请求多条日志用同一 id 串联);非 `/v1/` 路径(如 `/health` 健康检查)只记 debug 级,避免刷屏 |
+| `debug` | 额外输出:入站请求(敏感头 `authorization`/`api-key`/`cookie` 等已脱敏)、转发给 opencode serve 的**最终请求 payload**、完整响应(非流式输出完整 JSON;流式 SSE 不逐 chunk 刷屏,只在结束时输出汇总:chunk 数、文本长度、finish_reason) |
+
+`docker logs` 各等级输出示例:
+
+```text
+# info(默认,每个请求一行摘要 + 启动信息)
+[gateway] 2026-11-06T12:00:00.000Z [INFO] Log level: info (source: LOG_LEVEL)
+[gateway] 2026-11-06T12:00:00.123Z [INFO] [Proxy] Active at http://0.0.0.0:8083
+[gateway] 2026-11-06T12:00:05.456Z [INFO] POST /v1/chat/completions -> 200 3210ms [gw-m1abc2x3] model=opencode/kimi-k2.5-free stream=true
+[gateway] 2026-11-06T12:00:12.789Z [INFO] POST /v1/chat/completions -> 200 4822ms [gw-n4def5y6] model=opencode/glm-4.7-free stream=false
+
+# debug(额外输出完整请求体与响应;敏感头脱敏)
+[gateway] 2026-11-06T12:00:05.010Z [DEBUG] Incoming OpenAI request {"reqId":"gw-m1abc2x3","headers":{"authorization":"Bear***c9Zw","content-type":"application/json"},"body":{"model":"opencode/kimi-k2.5-free","messages":[...],"stream":true}}
+[gateway] 2026-11-06T12:00:05.032Z [DEBUG] Upstream payload (final request body to opencode serve) {"reqId":"gw-m1abc2x3","sessionId":"ses_...","model":"opencode/kimi-k2.5-free","payload":{"path":{"id":"ses_..."},"body":{"model":{...},"system":"...","parts":[...],"tools":{...}}}}
+[gateway] 2026-11-06T12:00:05.460Z [DEBUG] SSE stream summary {"reqId":"gw-m1abc2x3","chunks":12,"contentChars":866,"reasoningChars":0,"finishReason":"stop"}
+[gateway] 2026-11-06T12:00:12.780Z [DEBUG] Upstream response (non-stream full JSON) {"reqId":"gw-n4def5y6","response":{"id":"chatcmpl-...","choices":[{"message":{"content":"..."}}],"finish_reason":"stop"}}
+
+# error(上游失败必输出,含状态码与错误体摘要)
+[gateway] 2026-11-06T12:01:00.000Z [ERROR] [Proxy] API Error (upstream call failed) {"reqId":"gw-o7ghi8z9","sessionId":"ses_...","message":"Request timeout after 300000ms","status":null,"bodySummary":null}
+
+# 非法等级回退告警
+[gateway] 2026-11-06T12:02:00.000Z [WARN] Invalid LOG_LEVEL 'verbose', fallback to 'info' (valid values: error/warn/info/debug)
+```
 
 ### 4097 后端端口对外访问
 

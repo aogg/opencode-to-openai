@@ -2,10 +2,13 @@
 # opencode-to-openai 容器入口
 # 首次启动(容器内无 /app/config.json)时按 docker run -e 环境变量生成配置;
 # 已有 config.json(如 -v 挂载持久化)则直接使用, 不被 -e 覆盖
-# 支持: PORT API_KEY BIND_HOST DISABLE_TOOLS OPENCODE_PATH OPENCODE_SERVER_URL OPENCODE_BIND_HOST
+# 支持(写入 config.json): PORT API_KEY BIND_HOST DISABLE_TOOLS OPENCODE_PATH OPENCODE_SERVER_URL OPENCODE_BIND_HOST
+# 日志等级 LOG_LEVEL(error/warn/info/debug, 不区分大小写)不写入 config.json:
+#   由 node 进程直接读取环境变量生效, 优先级高于 config.json 里的 LOG_LEVEL 字段, 未设置时默认 info
 set -e
 
 CONFIG=/app/config.json
+LOG_LEVEL_DISPLAY="${LOG_LEVEL:-info}"
 
 if [ ! -f "$CONFIG" ]; then
     node -e '
@@ -23,9 +26,11 @@ if [ ! -f "$CONFIG" ]; then
         };
         fs.writeFileSync("/app/config.json", JSON.stringify(cfg, null, 4));
         console.log("[entrypoint] first boot, config generated from env:", JSON.stringify(cfg));
+        console.log("[entrypoint] log level (LOG_LEVEL env, higher priority than config.json):", env("LOG_LEVEL", "info"));
     '
 else
     echo "[entrypoint] /app/config.json exists, use it as-is (recreate container without the volume to re-apply -e)"
+    echo "[entrypoint] log level (LOG_LEVEL env, higher priority than config.json): $LOG_LEVEL_DISPLAY"
 fi
 
 exec "$@"

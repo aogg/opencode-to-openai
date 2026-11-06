@@ -8,6 +8,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { fileURLToPath } from 'url';
+import { logger, maskHeaders } from './logger.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -240,7 +241,7 @@ function cleanupTempDirs() {
             fs.rmSync(jailRoot, { recursive: true, force: true });
         }
     } catch (e) {
-        console.error('[Cleanup] Failed to remove temp dirs:', e.message);
+        logger.error('[Cleanup] Failed to remove temp dirs:', { error: e.message });
     }
 }
 
@@ -250,12 +251,12 @@ process.on('exit', cleanupTempDirs);
 // Handle signals - Unix-like systems
 if (process.platform !== 'win32') {
     process.on('SIGINT', () => {
-        console.log('\n[Shutdown] Received SIGINT, cleaning up...');
+        logger.info('[Shutdown] Received SIGINT, cleaning up...');
         cleanupTempDirs();
         process.exit(0);
     });
     process.on('SIGTERM', () => {
-        console.log('\n[Shutdown] Received SIGTERM, cleaning up...');
+        logger.info('[Shutdown] Received SIGTERM, cleaning up...');
         cleanupTempDirs();
         process.exit(0);
     });
@@ -263,12 +264,56 @@ if (process.platform !== 'win32') {
 // Note: Windows signal handling is limited, cleanup is handled via process.on('exit')
 
 /**
+ * 从上游(opencode serve)调用错误中尽力提取状态码与错误体摘要
+ * SDK 错误结构随版本可能不同, 兼容常见字段: response.{status,data} / status / statusCode / responseBody / data / body
+ */
+function extractUpstreamError(error) {
+    const status = error?.response?.status ?? error?.status ?? error?.statusCode ?? null;
+    const body = error?.response?.data ?? error?.responseBody ?? error?.data ?? error?.body ?? null;
+    let bodySummary = null;
+    if (typeof body === 'string') {
+        bodySummary = body.slice(0, 500) || null;
+    } else if (body !== null && body !== undefined) {
+        try {
+            bodySummary = JSON.stringify(body).slice(0, 500);
+        } catch (e) {
+            // 序列化失败不静默: 摘要中注明原因
+            bodySummary = `[unserializable: ${e?.message || 'unknown error'}]`;
+        }
+    }
+    return { status, bodySummary };
+}
+
+/**
  * Create Express app with proper configuration
  */
 function createApp(config) {
-    const { API_KEY, OPENCODE_SERVER_URL, REQUEST_TIMEOUT_MS, DEBUG, DISABLE_TOOLS } = config;
+    // DEBUG 不再直接控制输出(由 startProxy 统一映射为 debug 日志等级), 故不在此解构
+    const { API_KEY, OPENCODE_SERVER_URL, REQUEST_TIMEOUT_MS, DISABLE_TOOLS } = config;
 
     const app = express();
+
+    // 请求日志中间件(最先挂载, 覆盖全部请求含 401/404):
+    // info 级输出每个 OpenAI 兼容请求(/v1/*)的一行摘要; 其余路径(/health 等)仅 debug 级, 避免健康检查刷屏
+    app.use((req, res, next) => {
+        const reqId = `gw-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+        const startedAt = Date.now();
+        req.gatewayLog = { reqId };
+        res.on('finish', () => {
+            const meta = req.gatewayLog || {};
+            const model = meta.model || '-';
+            const streamText = typeof meta.stream === 'boolean' ? String(meta.stream) : '-';
+            const line = `${req.method} ${req.originalUrl} -> ${res.statusCode} ${Date.now() - startedAt}ms [${reqId}] model=${model} stream=${streamText}`;
+            const isOpenAiPath = req.path && req.path.startsWith('/v1/');
+            if (isOpenAiPath) {
+                logger.info(line);
+            } else {
+                logger.debug(line);
+            }
+        });
+        next();
+    });
+
     app.use(cors({
         origin: '*',
         methods: ['GET', 'POST', 'OPTIONS'],
@@ -314,16 +359,13 @@ function createApp(config) {
             });
             res.json({ object: 'list', data: models });
         } catch (error) {
-            console.error('[Proxy] Model Fetch Error:', error.message);
+            logger.error('[Proxy] Model Fetch Error:', { error: error.message, status: error.status, body: error.response?.data || error.responseBody || null });
             res.json({ object: 'list', data: [{ id: 'opencode/kimi-k2.5-free', object: 'model' }] });
         }
     });
 
-    const logDebug = (...args) => {
-        if (DEBUG) {
-            console.log('[Proxy][Debug]', ...args);
-        }
-    };
+    // debug 日志统一走 logger(LOG_LEVEL=debug 时可见; 兼容旧 DEBUG 开关, startProxy 会把 DEBUG=true 映射为 debug 等级)
+    const logDebug = (...args) => logger.debug(...args);
 
     const TOOL_GUARD_MESSAGE = 'Tools are disabled. Do not call tools or function calls. Answer directly from the conversation and general knowledge. If external or real-time data is required, say so and ask the user to enable tools.';
     const applyToolGuard = (systemMsg) => {
@@ -440,7 +482,7 @@ function createApp(config) {
                     const done = Boolean(info.finish || info.time?.completed || error);
                     if (done || content || reasoning) {
                         if (error) {
-                            console.error('[Proxy] OpenCode assistant error:', error);
+                            logger.error('[Proxy] OpenCode assistant error:', { sessionId, error });
                         }
                         logDebug('Polling completed', {
                             sessionId,
@@ -590,6 +632,14 @@ function createApp(config) {
                 let eventStream = null;
 
                 try {
+                    const reqId = req.gatewayLog?.reqId || null;
+                    logger.debug('Incoming OpenAI request', {
+                        reqId,
+                        method: req.method,
+                        path: req.originalUrl,
+                        headers: maskHeaders(req.headers),
+                        body: req.body
+                    });
                     const { messages, model, stream } = req.body;
                     if (!messages || !Array.isArray(messages) || messages.length === 0) {
                         return res.status(400).json({ error: { message: 'messages array is required' } });
@@ -597,6 +647,10 @@ function createApp(config) {
 
                     let [pID, mID] = (model || 'opencode/kimi-k2.5-free').split('/');
                     if (!mID) { mID = pID; pID = 'opencode'; }
+                    if (req.gatewayLog) {
+                        req.gatewayLog.model = `${pID}/${mID}`;
+                        req.gatewayLog.stream = Boolean(stream);
+                    }
 
                     const normalizeMessageContent = (content) => {
                         if (typeof content === 'string') return content;
@@ -676,6 +730,12 @@ function createApp(config) {
                     if (toolOverrides && Object.keys(toolOverrides).length > 0) {
                         promptParams.body.tools = toolOverrides;
                     }
+                    logger.debug('Upstream payload (final request body to opencode serve)', {
+                        reqId,
+                        sessionId,
+                        model: `${pID}/${mID}`,
+                        payload: promptParams
+                    });
 
                     if (stream) {
                         res.setHeader('Content-Type', 'text/event-stream');
@@ -685,6 +745,7 @@ function createApp(config) {
                         const filterReasoningDelta = createToolCallFilter();
                         let streamedContent = '';
                         let streamedReasoning = '';
+                        let sseChunkCount = 0;
 
                         const sendDelta = (delta, isReasoning = false) => {
                             if (!delta) return;
@@ -708,6 +769,7 @@ function createApp(config) {
                                 chunk.choices[0].delta.content = filtered;
                             }
                             res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+                            sseChunkCount++;
                         };
 
                         let collected = null;
@@ -782,8 +844,18 @@ function createApp(config) {
                         }
 
                         res.write(`data: ${JSON.stringify({ id, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
+                        sseChunkCount++;
                         res.write('data: [DONE]\n\n');
                         res.end();
+                        logger.debug('SSE stream summary', {
+                            reqId,
+                            sessionId,
+                            model: `${pID}/${mID}`,
+                            chunks: sseChunkCount,
+                            contentChars: streamedContent.length,
+                            reasoningChars: streamedReasoning.length,
+                            finishReason: 'stop'
+                        });
                     } else {
                         const promptStart = Date.now();
                         await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
@@ -800,7 +872,7 @@ function createApp(config) {
                         const safeContent = stripFunctionCalls(content);
                         const safeReasoning = stripFunctionCalls(reasoning);
 
-                        res.json({
+                        const responsePayload = {
                             id: `chatcmpl-${Date.now()}`,
                             object: 'chat.completion',
                             created: Math.floor(Date.now() / 1000),
@@ -811,11 +883,25 @@ function createApp(config) {
                                 finish_reason: 'stop'
                             }],
                             usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+                        };
+                        logger.debug('Upstream response (non-stream full JSON)', {
+                            reqId,
+                            sessionId,
+                            response: responsePayload
                         });
+                        res.json(responsePayload);
                     }
                 } catch (error) {
-                    console.error('[Proxy] API Error:', error.message);
-                    console.error('[Proxy] Error details:', error);
+                    // 上游(opencode serve)调用链失败: error 级必输出, 含状态码与错误体摘要; 完整错误对象放 debug 级
+                    const upstream = extractUpstreamError(error);
+                    logger.error('[Proxy] API Error (upstream call failed)', {
+                        reqId,
+                        sessionId,
+                        message: error.message,
+                        status: upstream.status,
+                        bodySummary: upstream.bodySummary
+                    });
+                    logger.debug('[Proxy] Error details', { reqId, sessionId, error });
 
                     if (!res.headersSent) {
                         let errorMessage = error.message;
@@ -837,7 +923,7 @@ function createApp(config) {
                         try {
                             await client.session.delete({ path: { id: sessionId } });
                         } catch (e) {
-                            console.error('[Proxy] Failed to cleanup session on error:', e.message);
+                            logger.warn('[Proxy] Failed to cleanup session on error:', { sessionId, error: e.message });
                         }
                     }
                 } finally {
@@ -847,7 +933,7 @@ function createApp(config) {
                 }
             }, REQUEST_TIMEOUT_MS + 20000);
         } catch (error) {
-            console.error('[Proxy] Request Handler Error:', error.message);
+            logger.error('[Proxy] Request Handler Error:', { message: error.message, stack: error.stack });
             if (!res.headersSent) {
                 res.status(500).json({ error: { message: error.message, type: error.constructor.name } });
             }
@@ -899,7 +985,7 @@ async function ensureBackend(config) {
         await checkHealth(OPENCODE_SERVER_URL);
     } catch (err) {
         state.isStarting = true;
-        console.log(`[Proxy] OpenCode backend not found at ${OPENCODE_SERVER_URL}. Starting...`);
+        logger.info(`[Proxy] OpenCode backend not found at ${OPENCODE_SERVER_URL}. Starting...`);
 
         // Kill existing process if any
         if (state.process) {
@@ -939,7 +1025,7 @@ async function ensureBackend(config) {
                 ...process.env,
                 OPENCODE_PROJECT_DIR: workspace
             };
-            console.log('[Proxy] Running on Windows, using standard user home directory');
+            logger.info('[Proxy] Running on Windows, using standard user home directory');
         } else {
             fs.mkdirSync(workspace, { recursive: true });
             cwd = workspace;
@@ -964,13 +1050,13 @@ async function ensureBackend(config) {
                     USERPROFILE: fakeHome,
                     OPENCODE_PROJECT_DIR: workspace
                 };
-                console.log('[Proxy] Using isolated home for OpenCode');
+                logger.info('[Proxy] Using isolated home for OpenCode');
             } else {
                 envVars = {
                     ...process.env,
                     OPENCODE_PROJECT_DIR: workspace
                 };
-                console.log('[Proxy] Using real HOME for OpenCode (isolation disabled)');
+                logger.info('[Proxy] Using real HOME for OpenCode (isolation disabled)');
             }
         }
 
@@ -979,9 +1065,9 @@ async function ensureBackend(config) {
         const resolved = resolveOpencodePath(OPENCODE_PATH);
         const opencodeBin = resolved.path || OPENCODE_PATH || OPENCODE_BASENAME;
         if (resolved.path) {
-            console.log(`[Proxy] Using OpenCode binary: ${opencodeBin} (source: ${resolved.source})`);
+            logger.info(`[Proxy] Using OpenCode binary: ${opencodeBin} (source: ${resolved.source})`);
         } else {
-            console.warn(`[Proxy] Unable to resolve OpenCode binary for '${OPENCODE_PATH}'. Using as-is.`);
+            logger.warn(`[Proxy] Unable to resolve OpenCode binary for '${OPENCODE_PATH}'. Using as-is.`);
         }
 
         // Cross-platform spawn options
@@ -996,15 +1082,15 @@ async function ensureBackend(config) {
 
         // 后端监听地址: OPENCODE_BIND_HOST(默认 127.0.0.1; Docker 内设 0.0.0.0 以便对外暴露 4097)
         const bindHost = OPENCODE_BIND_HOST || '127.0.0.1';
-        console.log(`[Proxy] Starting OpenCode backend: --port ${port} --hostname ${bindHost}`);
+        logger.info(`[Proxy] Starting OpenCode backend: --port ${port} --hostname ${bindHost}`);
         state.process = spawn(opencodeBin, ['serve', '--port', port, '--hostname', bindHost], spawnOptions);
 
         // Handle spawn errors
         state.process.on('error', (err) => {
-            console.error(`[Proxy] Failed to spawn OpenCode: ${err.message}`);
+            logger.error(`[Proxy] Failed to spawn OpenCode: ${err.message}`);
             if (err.code === 'ENOENT') {
-                console.error(`[Proxy] Command '${OPENCODE_PATH}' not found. Please ensure OpenCode is installed and in your PATH.`);
-                console.error(`[Proxy] You can specify the full path in config.json using 'OPENCODE_PATH'`);
+                logger.error(`[Proxy] Command '${OPENCODE_PATH}' not found. Please ensure OpenCode is installed and in your PATH.`);
+                logger.error(`[Proxy] You can specify the full path in config.json using 'OPENCODE_PATH'`);
             }
         });
 
@@ -1014,7 +1100,7 @@ async function ensureBackend(config) {
             await new Promise(r => setTimeout(r, STARTUP_WAIT_INTERVAL_MS));
             try {
                 await checkHealth(OPENCODE_SERVER_URL);
-                console.log('[Proxy] OpenCode backend ready.');
+                logger.info('[Proxy] OpenCode backend ready.');
                 started = true;
                 break;
             } catch (e) { }
@@ -1023,7 +1109,7 @@ async function ensureBackend(config) {
         state.isStarting = false;
 
         if (!started) {
-            console.warn('[Proxy] Backend start timed out.');
+            logger.warn('[Proxy] Backend start timed out.');
             throw new Error('Backend start timeout');
         }
     }
@@ -1057,6 +1143,8 @@ export function startProxy(options) {
         OPENCODE_BIND_HOST: options.OPENCODE_BIND_HOST || options.openCodeBindHost || process.env.OPENCODE_BIND_HOST || '127.0.0.1',
         OPENCODE_PATH: options.OPENCODE_PATH || 'opencode',
         BIND_HOST: options.BIND_HOST || options.bindHost || process.env.OPENCODE_PROXY_BIND_HOST || '127.0.0.1',
+        // LOG_LEVEL 原始值: index.js 已按 "env > config.json" 合并传入; 直启/插件场景回退读环境变量
+        LOG_LEVEL: options.LOG_LEVEL ?? options.logLevel ?? process.env.LOG_LEVEL ?? null,
         USE_ISOLATED_HOME: typeof options.USE_ISOLATED_HOME === 'boolean'
             ? options.USE_ISOLATED_HOME
             : String(options.USE_ISOLATED_HOME || '').toLowerCase() === 'true' ||
@@ -1071,14 +1159,29 @@ export function startProxy(options) {
             process.env.OPENCODE_PROXY_DEBUG === '1'
     };
 
+    // 日志等级解析(启动即校准, 后续所有日志按此等级输出):
+    // 1) LOG_LEVEL(options/env, 不区分大小写) 2) 未显式设置且旧 DEBUG 开关开启时提为 debug(向后兼容)
+    // 3) 默认 info; 非法值回退 info 并 warn 告警
+    let levelResolution = logger.setLevel(config.LOG_LEVEL);
+    if (!levelResolution.valid) {
+        logger.warn(`Invalid LOG_LEVEL '${levelResolution.requested}', fallback to 'info' (valid values: error/warn/info/debug)`);
+    } else if (!levelResolution.explicit && config.DEBUG) {
+        levelResolution = logger.setLevel('debug');
+    }
+    config.LOG_LEVEL = logger.level;
+    const levelSource = !levelResolution.explicit
+        ? (config.DEBUG ? 'legacy DEBUG flag' : 'default')
+        : 'LOG_LEVEL';
+
     const { app } = createApp(config);
-    
+
     const server = app.listen(config.PORT, config.BIND_HOST, async () => {
-        console.log(`[Proxy] Active at http://${config.BIND_HOST}:${config.PORT}`);
+        logger.info(`Log level: ${logger.level} (source: ${levelSource})`);
+        logger.info(`[Proxy] Active at http://${config.BIND_HOST}:${config.PORT}`);
         try {
             await ensureBackend(config);
         } catch (error) {
-            console.error('[Proxy] Backend warmup failed:', error.message);
+            logger.error('[Proxy] Backend warmup failed:', { error: error.message });
         }
     });
 
