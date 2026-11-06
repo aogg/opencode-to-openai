@@ -35,13 +35,18 @@ RUN npm install -g opencode-ai
 # 备选方式(若 npm 包安装有问题, 可换官方安装脚本):
 # RUN curl -fsSL https://opencode.ai/install | bash
 
-# 入口脚本: 首次启动按 docker run -e 环境变量生成 /app/config.json(支持 PORT/API_KEY/BIND_HOST/DISABLE_TOOLS/OPENCODE_PATH/OPENCODE_SERVER_URL)
+# 入口脚本: 首次启动按 docker run -e 环境变量生成 /app/config.json(支持 PORT/API_KEY/BIND_HOST/DISABLE_TOOLS/OPENCODE_PATH/OPENCODE_SERVER_URL/OPENCODE_BIND_HOST)
 # 该文件不在上游源码里, 由 workflow 在构建前从本仓库复制进构建上下文(project 目录)
 COPY docker/docker-entrypoint.sh /app/docker-entrypoint.sh
 RUN chmod +x /app/docker-entrypoint.sh
 
 # 网关监听端口(与 docker-entrypoint.sh 生成的 config.json 默认 PORT 一致)
 EXPOSE 8083
+
+# opencode serve 后端端口(4097)
+# 仅当 OPENCODE_BIND_HOST=0.0.0.0(容器内 -e 生成配置时的默认)且 docker run 带 -p 4097:4097 时才对外可达;
+# 网关自身始终经 OPENCODE_SERVER_URL(默认 http://127.0.0.1:4097)访问后端, 不受该变量影响
+EXPOSE 4097
 
 # 入口: entrypoint 先按 -e 生成/沿用 config.json, 再拉起下面的 CMD
 ENTRYPOINT ["/app/docker-entrypoint.sh"]

@@ -83,6 +83,7 @@ curl -X POST http://127.0.0.1:8083/v1/chat/completions \
 | `DISABLE_TOOLS` | `true` | 禁用 opencode 工具调用,避免模型在容器内执行命令/改文件 |
 | `OPENCODE_PATH` | 空(自动探测) | opencode 可执行文件路径;留空时按 PATH 查找(npm 全局安装在 `/usr/local/bin/opencode`),程序还会自动探测 `~/.opencode/bin`、npm/pnpm 全局目录 |
 | `OPENCODE_SERVER_URL` | `http://127.0.0.1:4097` | 网关内部自动拉起的 opencode 后端服务地址,一般不用改 |
+| `OPENCODE_BIND_HOST` | `0.0.0.0` | opencode 后端(4097)监听地址,容器内默认 `0.0.0.0`;程序内置默认 `127.0.0.1`(非容器场景行为不变),详见下方「4097 后端端口对外访问」 |
 
 示例(开启鉴权):
 
@@ -97,6 +98,30 @@ docker run -d --restart=always --network common-all --name opencode-to-openai --
 - `-e` 只在**首次启动**生成 config.json 时读取;`/app/config.json` 已存在时直接使用、**不被 `-e` 覆盖**(如 `-v` 挂载持久化的配置,优先于 `-e`)
 - 想用新的 `-e` 重新生成:删掉挂载的 config.json 文件(或去掉 `-v` 挂载)后重建容器即可
 - 程序运行时读取优先级为 **config.json > 带 `OPENCODE_` 前缀的程序内置环境变量(如 `OPENCODE_DISABLE_TOOLS`) > 程序内置默认**,所以上面 `-e` 生成的 config.json 是最终生效配置
+
+### 4097 后端端口对外访问
+
+网关(8083)启动时会自动在容器内拉起 opencode serve 后端(4097)。后端的监听地址由 `OPENCODE_BIND_HOST` 控制:容器内 `-e` 生成配置时默认 `0.0.0.0`,程序内置默认 `127.0.0.1`(仅容器内回环可用,对外不可达)。
+
+要在容器外直接访问 4097,`docker run` 增加端口映射 `-p 4097:4097`(需要时可用 `-e OPENCODE_BIND_HOST=0.0.0.0` 显式指定,容器内默认已是 `0.0.0.0`):
+
+```bash
+docker run -d \
+  --restart=always \
+  --network common-all \
+  --name opencode-to-openai \
+  --privileged \
+  -p 8083:8083 \
+  -p 4097:4097 \
+  adockero/opencode-to-openai
+```
+
+说明:
+
+- `OPENCODE_BIND_HOST` 只控制 opencode 后端(4097)的监听地址;网关(8083)自己的监听地址由 `BIND_HOST` 控制,两者互不影响
+- 网关自身始终按 `OPENCODE_SERVER_URL`(默认 `http://127.0.0.1:4097`)访问后端,`OPENCODE_BIND_HOST=0.0.0.0` 不影响网关与后端的容器内通信(0.0.0.0 覆盖回环地址)
+- 要改回仅容器内可用,设 `OPENCODE_BIND_HOST=127.0.0.1`(即程序内置默认)
+- 坑点:`-e` 只在容器**首次启动**生成 `/app/config.json` 时读取;容器内已有 `/app/config.json`(如 `-v` 挂载)时 `-e` 不生效,需直接改挂载的 config.json(把 `OPENCODE_BIND_HOST` 改为 `0.0.0.0`),或删掉该文件后重建容器
 
 ### 已知问题与兼容修复
 

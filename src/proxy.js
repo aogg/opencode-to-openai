@@ -870,7 +870,7 @@ const backendState = new Map();
  * Backend Lifecycle Management
  */
 async function ensureBackend(config) {
-    const { OPENCODE_SERVER_URL, OPENCODE_PATH, USE_ISOLATED_HOME } = config;
+    const { OPENCODE_SERVER_URL, OPENCODE_PATH, OPENCODE_BIND_HOST, USE_ISOLATED_HOME } = config;
     const stateKey = OPENCODE_SERVER_URL;
 
     if (!backendState.has(stateKey)) {
@@ -994,7 +994,10 @@ async function ensureBackend(config) {
             shell: useShell  // Use shell only when needed (e.g., Windows .cmd or unresolved PATH)
         };
 
-        state.process = spawn(opencodeBin, ['serve', '--port', port, '--hostname', '127.0.0.1'], spawnOptions);
+        // 后端监听地址: OPENCODE_BIND_HOST(默认 127.0.0.1; Docker 内设 0.0.0.0 以便对外暴露 4097)
+        const bindHost = OPENCODE_BIND_HOST || '127.0.0.1';
+        console.log(`[Proxy] Starting OpenCode backend: --port ${port} --hostname ${bindHost}`);
+        state.process = spawn(opencodeBin, ['serve', '--port', port, '--hostname', bindHost], spawnOptions);
 
         // Handle spawn errors
         state.process.on('error', (err) => {
@@ -1051,6 +1054,7 @@ export function startProxy(options) {
         PORT: options.PORT || 8083,
         API_KEY: options.API_KEY || '',
         OPENCODE_SERVER_URL: options.OPENCODE_SERVER_URL || 'http://127.0.0.1:4097',
+        OPENCODE_BIND_HOST: options.OPENCODE_BIND_HOST || options.openCodeBindHost || process.env.OPENCODE_BIND_HOST || '127.0.0.1',
         OPENCODE_PATH: options.OPENCODE_PATH || 'opencode',
         BIND_HOST: options.BIND_HOST || options.bindHost || process.env.OPENCODE_PROXY_BIND_HOST || '127.0.0.1',
         USE_ISOLATED_HOME: typeof options.USE_ISOLATED_HOME === 'boolean'
