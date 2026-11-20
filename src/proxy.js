@@ -15,14 +15,28 @@ import {
     previewText,
     summarizeUpstreamPayload
 } from './prompt-builder.js';
-import { collectSessionEvents } from './opencode-events.js';
+import { collectSessionEvents, extractFromParts } from './opencode-events.js';
+import { buildEchoPatterns, sanitizeAssistantText } from './output-guard.js';
+import {
+    DEFAULT_FAST_FAIL_RETRY_MS,
+    buildRetryFailure,
+    isUpstreamRetryError,
+    waitForPrompt
+} from './retry-guard.js';
+import {
+    DEFAULT_PROGRESS_LOG_INTERVAL_MS,
+    DEFAULT_STALL_WARN_MS,
+    createInflightRegistry
+} from './inflight.js';
+import {
+    DEFAULT_QUEUE_MAX_WAIT_MS,
+    buildQueueTimeoutResponse,
+    createSerialQueue,
+    isQueueTimeoutError
+} from './serial-queue.js';
 import { resolveOpencodeLogFile, startOpencodeLogTail } from './opencode-log-tail.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
-// --- Mutex Logic with Timeout ---
-const queue = [];
-let isProcessing = false;
 
 const STARTUP_WAIT_ITERATIONS = 60;
 const STARTUP_WAIT_INTERVAL_MS = 2000;
@@ -189,45 +203,6 @@ function resolveOpencodePath(requestedPath) {
     return { path: null, source: 'not-found' };
 }
 
-function processQueue() {
-    if (isProcessing || queue.length === 0) return;
-    isProcessing = true;
-    const { task, timeout, resolve, reject } = queue.shift();
-    let settled = false;
-    const timeoutMs = timeout || 120000;
-    const timeoutId = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        reject(new Error(`Request timeout after ${timeoutMs}ms`));
-    }, timeoutMs);
-
-    Promise.resolve()
-        .then(() => task())
-        .then((result) => {
-            if (settled) return;
-            settled = true;
-            clearTimeout(timeoutId);
-            resolve(result);
-        })
-        .catch((err) => {
-            if (settled) return;
-            settled = true;
-            clearTimeout(timeoutId);
-            reject(err);
-        })
-        .finally(() => {
-            isProcessing = false;
-            setTimeout(processQueue, 100);
-        });
-}
-
-function lock(task, timeout = 120000) {
-    return new Promise((resolve, reject) => {
-        queue.push({ task, timeout, resolve, reject });
-        processQueue();
-    });
-}
-
 /**
  * Robust Health Check Helper
  */
@@ -350,8 +325,9 @@ function assertNoUpstreamError(result, label) {
 
 /**
  * Create Express app with proper configuration
+ * (导出便于本地冒烟测试: 用 stub 依赖直接调用路由处理函数, 不启动真实服务)
  */
-function createApp(config) {
+export function createApp(config) {
     // DEBUG 不再直接控制输出(由 startProxy 统一映射为 debug 日志等级), 故不在此解构
     const {
         API_KEY,
@@ -363,7 +339,11 @@ function createApp(config) {
         OPENCODE_STREAM_TOOLS,
         SYSTEM_PROMPT_PATTERNS,
         EVENT_IDLE_TIMEOUT_MS,
-        SSE_HEARTBEAT_MS
+        SSE_HEARTBEAT_MS,
+        FAST_FAIL_RETRY_MS,
+        QUEUE_MAX_WAIT_MS,
+        PROGRESS_LOG_INTERVAL_MS,
+        STALL_WARN_MS
     } = config;
 
     const app = express();
@@ -407,6 +387,31 @@ function createApp(config) {
         mode: promptPatterns.disabled ? 'disabled' : (promptPatterns.configured ? 'custom' : 'default'),
         count: promptPatterns.patterns.length,
         patterns: promptPatterns.sources
+    });
+
+    /*
+     * 输出侧兜底标记: 与系统提示词提升共用 SYSTEM_PROMPT_PATTERNS, 另加角色前缀等额外标记。
+     * 上游把 user/system 内容当 assistant part 回显时, 响应里裁掉(流式按增量、非流式按整段)。
+     */
+    const echoPatterns = buildEchoPatterns(SYSTEM_PROMPT_PATTERNS);
+    logger.info('[Proxy] Output echo guard loaded', {
+        count: echoPatterns.length,
+        markers: echoPatterns.map((item) => item.source)
+    });
+
+    /* 在途请求注册表: 每 PROGRESS_LOG_INTERVAL_MS 输出进度 + 卡住看门狗 + GET /v1/gateway/inflight 查询 */
+    const inflight = createInflightRegistry({
+        logger,
+        progressIntervalMs: PROGRESS_LOG_INTERVAL_MS,
+        stallWarnMs: STALL_WARN_MS
+    });
+    inflight.startWatchdog();
+
+    /* 单并发队列(带排队上限): 上游卡住时后续请求不再无限排队, 超过 QUEUE_MAX_WAIT_MS 直接 503 */
+    const serialQueue = createSerialQueue({
+        logger,
+        maxWaitMs: QUEUE_MAX_WAIT_MS,
+        nextDelayMs: 100
     });
 
     // Auth middleware
@@ -531,30 +536,56 @@ function createApp(config) {
         }
     };
 
-    async function promptWithTimeout(promptParams, timeoutMs) {
-        let timeoutId = null;
-        const timeoutPromise = new Promise((_, reject) => {
-            timeoutId = setTimeout(() => reject(new Error(`Request timeout after ${timeoutMs}ms`)), timeoutMs);
-        });
-        try {
-            return await Promise.race([client.session.prompt(promptParams), timeoutPromise]);
-        } finally {
-            /* 正常完成时清掉定时器, 避免每个请求残留一个 300s 定时器 */
-            if (timeoutId) clearTimeout(timeoutId);
+    /**
+     * 带超时的上游 prompt 调用; 传 fastFailPromise 时收到快速失败信号立即返回(不等 300s 超时定时器)
+     * @param {object} promptParams client.session.prompt 参数
+     * @param {number} timeoutMs 总超时
+     * @param {Promise<object>|null} fastFailPromise collector.fastFailPromise
+     */
+    async function promptWithTimeout(promptParams, timeoutMs, fastFailPromise = null) {
+        return waitForPrompt(client.session.prompt(promptParams), timeoutMs, fastFailPromise);
+    }
+
+    /**
+     * 输出侧兜底: 裁掉 assistant 内容里的系统注入片段(非流式/轮询路径), 命中时 WARN 便于排查
+     * @param {string} text 上游汇总出来的 assistant 文本
+     * @param {{reqId?: string|null, sessionId?: string|null, channel?: string, source?: string}} meta
+     * @returns {string}
+     */
+    function sanitizeAssistantOutput(text, meta = {}) {
+        const result = sanitizeAssistantText(text, echoPatterns);
+        if (result.removedChars > 0) {
+            logger.warn('[Proxy] System prompt echo removed from output', {
+                reqId: meta.reqId || null,
+                sessionId: meta.sessionId || null,
+                channel: meta.channel || 'content',
+                source: meta.source || 'poll',
+                markers: result.hits,
+                removedChars: result.removedChars
+            });
         }
+        return result.text;
     }
 
-    function extractFromParts(parts) {
-        if (!Array.isArray(parts)) return { content: '', reasoning: '' };
-        const content = parts.filter(p => p.type === 'text').map(p => p.text).join('');
-        const reasoning = parts.filter(p => p.type === 'reasoning').map(p => p.text).join('');
-        return { content, reasoning };
-    }
-
-    async function pollForAssistantResponse(sessionId, timeoutMs, intervalMs = DEFAULT_POLL_INTERVAL_MS) {
+    /**
+     * 轮询兜底: 取最近一条 assistant 消息的正文/推理
+     * - 只认 role=assistant 的消息(上游把 user/system 内容塞进 assistant part 的极端情况由 sanitizeAssistantOutput 兜底)
+     * - 轮询期间收到快速失败信号立即抛 UpstreamRetryError
+     * @param {string} sessionId
+     * @param {number} timeoutMs
+     * @param {number} intervalMs
+     * @param {{getFastFail?: Function, reqId?: string|null}} [options]
+     */
+    async function pollForAssistantResponse(sessionId, timeoutMs, intervalMs = DEFAULT_POLL_INTERVAL_MS, options = {}) {
+        const getFastFail = typeof options.getFastFail === 'function' ? options.getFastFail : null;
+        const reqId = options.reqId || null;
         const pollStart = Date.now();
         const startedAt = Date.now();
         while (Date.now() - startedAt < timeoutMs) {
+            const fastFailInfo = getFastFail ? getFastFail() : null;
+            if (fastFailInfo) {
+                throw new UpstreamRetryError(fastFailInfo);
+            }
             const messagesRes = await client.session.messages({ path: { id: sessionId } });
             const messages = messagesRes?.data || messagesRes || [];
             if (Array.isArray(messages) && messages.length) {
@@ -562,14 +593,18 @@ function createApp(config) {
                     const entry = messages[i];
                     const info = entry?.info;
                     if (info?.role !== 'assistant') continue;
-                    const { content, reasoning } = extractFromParts(entry?.parts || []);
+                    const raw = extractFromParts(entry?.parts || []);
+                    /* 输出侧兜底: 即使上游把 user/system 文本当 assistant part 回显, 这里也不会下发 */
+                    const content = sanitizeAssistantOutput(raw.content, { reqId, sessionId, channel: 'content', source: 'poll' });
+                    const reasoning = sanitizeAssistantOutput(raw.reasoning, { reqId, sessionId, channel: 'reasoning', source: 'poll' });
                     const error = info?.error || null;
                     const done = Boolean(info.finish || info.time?.completed || error);
                     if (done || content || reasoning) {
                         if (error) {
-                            logger.error('[Proxy] OpenCode assistant error:', { sessionId, error });
+                            logger.error('[Proxy] OpenCode assistant error:', { reqId, sessionId, error });
                         }
                         logDebug('Polling completed', {
+                            reqId,
                             sessionId,
                             ms: Date.now() - pollStart,
                             done,
@@ -583,448 +618,597 @@ function createApp(config) {
             }
             await sleep(intervalMs);
         }
-        logDebug('Polling timeout', { sessionId, ms: Date.now() - pollStart });
+        logDebug('Polling timeout', { reqId, sessionId, ms: Date.now() - pollStart });
         throw new Error(`Request timeout after ${timeoutMs}ms`);
+    }
+
+    /** 尽力删除会话(错误/快速失败收尾), 失败只告警 */
+    async function deleteSessionQuietly(sessionId, reqId = null) {
+        if (!sessionId) return;
+        try {
+            await client.session.delete({ path: { id: sessionId } });
+            logDebug('Session deleted after failure', { reqId, sessionId });
+        } catch (e) {
+            logger.warn('[Proxy] Failed to cleanup session on error:', { reqId, sessionId, error: e.message });
+        }
     }
 
     // Chat completions endpoint
     app.post('/v1/chat/completions', async (req, res) => {
+        const reqId = req.gatewayLog?.reqId || null;
+        const enqueuedAt = Date.now();
+        /* 在途注册表: 请求一进来就登记(含排队阶段), 排队进度日志/卡住看门狗/在途查询共用 */
+        inflight.register({ reqId, phase: 'queue', startedAt: enqueuedAt });
         try {
-            /* 入队时间: 单并发锁下, 复杂任务会把后续请求排住, 用于输出排队等待时长 */
-            const enqueuedAt = Date.now();
-            await lock(async () => {
-                let sessionId = null;
-                /* reqId/phase/requestStartedAt 必须声明在 try 之外: catch 里的错误日志要用到它们 */
-                let reqId = null;
-                let phase = 'init';
-                const requestStartedAt = Date.now();
-
-                try {
-                    reqId = req.gatewayLog?.reqId || null;
-                    const queueWaitMs = Date.now() - enqueuedAt;
-                    if (queueWaitMs > 0) {
-                        logger.info('[Proxy] Queue wait', { reqId, waitedMs: queueWaitMs, queueLength: queue.length });
-                    }
-                    logger.debug('Incoming OpenAI request', {
-                        reqId,
-                        method: req.method,
-                        path: req.originalUrl,
-                        headers: maskHeaders(req.headers),
-                        body: req.body
-                    });
-                    const { messages, model, stream } = req.body;
-                    if (!messages || !Array.isArray(messages) || messages.length === 0) {
-                        return res.status(400).json({ error: { message: 'messages array is required' } });
-                    }
-
-                    let [pID, mID] = (model || 'opencode/kimi-k2.5-free').split('/');
-                    if (!mID) { mID = pID; pID = 'opencode'; }
-                    if (req.gatewayLog) {
-                        req.gatewayLog.model = `${pID}/${mID}`;
-                        req.gatewayLog.stream = Boolean(stream);
-                    }
-
-                    /* 系统提示词分离: role=system 进 body.system; 命中规则的 user 消息也提升到 body.system, 不拼进 parts */
-                    const built = buildPromptMessages(messages, promptPatterns.disabled ? [] : promptPatterns.patterns);
-                    const { parts, system: systemMsg, lastUserMsg, stats: promptStats } = built;
-                    const systemWithGuard = applyToolGuard(systemMsg);
-                    const modelLabel = `${pID}/${mID}`;
-
-                    /* info 级默认输出"收到请求": 即使后面卡住, 也能看到请求确实进来了 */
-                    logger.info('[Proxy] Request received', {
-                        reqId,
-                        model: modelLabel,
-                        stream: Boolean(stream),
-                        messages: messages.length,
-                        lastUser: previewText(lastUserMsg, 120),
-                        hasSystem: Boolean(systemWithGuard),
-                        systemChars: systemWithGuard ? systemWithGuard.length : 0,
-                        promotedSystemMessages: promptStats.promotedCount,
-                        promotedChars: promptStats.promotedChars,
-                        parts: parts.length
-                    });
-
-                    if (!parts.length) {
-                        return res.status(400).json({ error: { message: 'messages must include at least one non-system text message' } });
-                    }
-                    logDebug('Request start', {
-                        model: modelLabel,
-                        stream: Boolean(stream),
-                        userMessages: messages.length,
-                        system: Boolean(systemMsg),
-                        lastUserLength: lastUserMsg.length,
-                        parts: parts.length,
-                        disableTools: DISABLE_TOOLS,
-                        promptStats
-                    });
-                    if (promptStats.promotedCount > 0) {
-                        logger.debug('[Proxy] System prompt messages promoted out of user parts', {
-                            reqId,
-                            promotedCount: promptStats.promotedCount,
-                            promotedChars: promptStats.promotedChars,
-                            systemChars: systemWithGuard ? systemWithGuard.length : 0
-                        });
-                    }
-
-                    // Ensure backend is running(阶段日志: 后端就绪 + 耗时)
-                    phase = 'backend';
-                    const backendStartedAt = Date.now();
-                    const backend = await ensureBackend(config);
-                    const workdir = OPENCODE_WORKDIR || backend?.workdir || null;
-                    logger.info('[Proxy] Backend ready', {
-                        reqId,
-                        ms: Date.now() - backendStartedAt,
-                        spawned: Boolean(backend?.spawnedThisTime),
-                        workdir: workdir || null
-                    });
-
-                    // Create session(在 OPENCODE_WORKDIR 指定的目录里干活; 未配置时用 jail 空目录)
-                    phase = 'session';
-                    const sessionStartedAt = Date.now();
-                    const sessionParams = workdir ? { query: { directory: workdir } } : {};
-                    const sessionRes = await client.session.create(sessionParams);
-                    assertNoUpstreamError(sessionRes, 'Create OpenCode session');
-                    sessionId = sessionRes.data?.id;
-                    if (!sessionId) throw new Error('Failed to create OpenCode session (no session id in response)');
-                    logger.info('[Proxy] Session created', {
-                        reqId,
-                        sessionId,
-                        ms: Date.now() - sessionStartedAt,
-                        workdir: workdir || null
-                    });
-
-                    const promptParams = {
-                        path: { id: sessionId },
-                        body: {
-                            model: { providerID: pID, modelID: mID },
-                            system: systemWithGuard,
-                            parts: parts
-                        }
-                    };
-                    if (workdir) promptParams.query = { directory: workdir };
-                    const toolOverrides = await getToolOverrides();
-                    if (toolOverrides && Object.keys(toolOverrides).length > 0) {
-                        promptParams.body.tools = toolOverrides;
-                    }
-                    logger.debug('Upstream payload (final request body to opencode serve)', summarizeUpstreamPayload(promptParams, {
-                        reqId,
-                        sessionId,
-                        model: modelLabel,
-                        disableTools: DISABLE_TOOLS
-                    }));
-
-                    if (stream) {
-                        res.setHeader('Content-Type', 'text/event-stream');
-                        res.setHeader('Cache-Control', 'no-cache');
-                        const id = `chatcmpl-${Date.now()}`;
-                        const filterContentDelta = createToolCallFilter();
-                        const filterReasoningDelta = createToolCallFilter();
-                        let streamedContent = '';
-                        let streamedReasoning = '';
-                        let sseChunkCount = 0;
-
-                        let clientGone = false;
-                        res.on('close', () => { clientGone = true; });
-                        const writeSse = (text) => {
-                            if (clientGone || res.writableEnded) return false;
-                            res.write(text);
-                            return true;
-                        };
-
-                        /* 心跳: 长任务期间定期发 SSE 注释(: ping), 避免客户端/中间层把连接当空闲断开。
-                           响应结束/客户端断开/异常路径都会清理, 不依赖业务代码走到固定位置 */
-                        const heartbeatId = setInterval(() => {
-                            writeSse(': ping\n\n');
-                        }, SSE_HEARTBEAT_MS);
-                        if (typeof heartbeatId.unref === 'function') heartbeatId.unref();
-                        res.on('finish', () => clearInterval(heartbeatId));
-                        res.on('close', () => clearInterval(heartbeatId));
-
-                        const sendDelta = (delta, isReasoning = false) => {
-                            if (!delta) return;
-                            const filtered = isReasoning ? filterReasoningDelta(delta) : filterContentDelta(delta);
-                            if (!filtered) return;
-                            if (isReasoning) {
-                                streamedReasoning += filtered;
-                            } else {
-                                streamedContent += filtered;
-                            }
-                            const chunk = {
-                                id,
-                                object: 'chat.completion.chunk',
-                                created: Math.floor(Date.now() / 1000),
-                                model: `${pID}/${mID}`,
-                                choices: [{ index: 0, delta: {}, finish_reason: null }]
-                            };
-                            if (isReasoning) {
-                                chunk.choices[0].delta.reasoning_content = filtered;
-                            } else {
-                                chunk.choices[0].delta.content = filtered;
-                            }
-                            if (writeSse(`data: ${JSON.stringify(chunk)}\n\n`)) sseChunkCount++;
-                        };
-
-                        /* 可选: 把 opencode 工具进度作为 SSE 注释行输出(默认关闭; 注释行不影响客户端解析) */
-                        const onToolActivity = OPENCODE_STREAM_TOOLS
-                            ? (activity) => {
-                                const label = activity.tool ? `${activity.tool} ${activity.status}` : activity.status;
-                                const detail = activity.input || activity.output || activity.error || '';
-                                writeSse(`: tool ${label}${detail ? ` - ${detail}` : ''}\n\n`);
-                            }
-                            : null;
-
-                        let collected = null;
-                        phase = 'prompt';
-                        const collector = collectSessionEvents({
-                            client,
-                            sessionId,
-                            reqId,
-                            timeoutMs: REQUEST_TIMEOUT_MS,
-                            firstDeltaTimeoutMs: DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
-                            idleTimeoutMs: EVENT_IDLE_TIMEOUT_MS,
-                            autoApprovePermission: OPENCODE_AUTO_APPROVE,
-                            directory: workdir,
-                            onDelta: sendDelta,
-                            onTool: onToolActivity
-                        });
-                        try {
-                            await collector.ready;
-                            const promptStart = Date.now();
-                            const promptResult = await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
-                            assertNoUpstreamError(promptResult, 'Send prompt');
-                            logger.info('[Proxy] Prompt sent', {
-                                reqId,
-                                sessionId,
-                                ms: Date.now() - promptStart,
-                                parts: parts.length,
-                                systemChars: systemWithGuard ? systemWithGuard.length : 0
-                            });
-                            phase = 'collect';
-                            collected = await collector.promise;
-                        } finally {
-                            collector.abort();
-                        }
-
-                        if (!collected || collected.error || collected.timedOut) {
-                            logger.debug('SSE collect error, falling back to polling', {
-                                sessionId,
-                                error: collected?.error?.message || null,
-                                reason: collected?.reason || 'none'
-                            });
-                            const { content, reasoning, error } = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
-                            if (error && !content && !reasoning) {
-                                sendDelta(`[Proxy Error] ${error.name || 'OpenCodeError'}: ${error.data?.message || error.message || 'Unknown error'}`);
-                            } else {
-                                const safeReasoning = stripFunctionCalls(reasoning, false);
-                                const safeContent = stripFunctionCalls(content, false);
-                                if (safeReasoning) sendDelta(safeReasoning, true);
-                                if (safeContent) sendDelta(safeContent, false);
-                            }
-                        } else if (collected && collected.noData) {
-                            logDebug('Fallback to polling (stream)', { sessionId });
-                            const { content, reasoning, error } = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
-                            if (error && !content && !reasoning) {
-                                sendDelta(`[Proxy Error] ${error.name || 'OpenCodeError'}: ${error.data?.message || error.message || 'Unknown error'}`);
-                            } else {
-                                const safeReasoning = stripFunctionCalls(reasoning, false);
-                                const safeContent = stripFunctionCalls(content, false);
-                                if (safeReasoning) sendDelta(safeReasoning, true);
-                                if (safeContent) sendDelta(safeContent, false);
-                            }
-                        } else if (collected && collected.idleTimeout) {
-                            logDebug('SSE idle timeout, polling for completion', { sessionId });
-                            const { content, reasoning, error } = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
-                            if (error && !content && !reasoning) {
-                                sendDelta(`[Proxy Error] ${error.name || 'OpenCodeError'}: ${error.data?.message || error.message || 'Unknown error'}`);
-                            } else {
-                                const safeReasoning = stripFunctionCalls(reasoning, false);
-                                const safeContent = stripFunctionCalls(content, false);
-                                const remainingReasoning = safeReasoning && safeReasoning.startsWith(streamedReasoning)
-                                    ? safeReasoning.slice(streamedReasoning.length)
-                                    : safeReasoning;
-                                const remainingContent = safeContent && safeContent.startsWith(streamedContent)
-                                    ? safeContent.slice(streamedContent.length)
-                                    : safeContent;
-                                if (remainingReasoning) sendDelta(remainingReasoning, true);
-                                if (remainingContent) sendDelta(remainingContent, false);
-                            }
-                        }
-
-                        /* opencode>=1.19 SSE delta 缺失时 assistant 快速 finish 会带空内容提前 resolve, 这里兜底轮询一次取完整回复再下发, 轮询也无内容则不发任何 delta */
-                        if (collected && !streamedContent && !streamedReasoning) {
-                            const { content: polledContent, reasoning: polledReasoning } = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
-                            const safePolledReasoning = stripFunctionCalls(polledReasoning, false);
-                            const safePolledContent = stripFunctionCalls(polledContent, false);
-                            if (safePolledReasoning) sendDelta(safePolledReasoning, true);
-                            if (safePolledContent) sendDelta(safePolledContent, false);
-                        }
-
-                        if (writeSse(`data: ${JSON.stringify({ id, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`)) sseChunkCount++;
-                        writeSse('data: [DONE]\n\n');
-                        res.end();
-                        logger.info('[Proxy] Request completed', {
-                            reqId,
-                            sessionId,
-                            model: `${pID}/${mID}`,
-                            stream: true,
-                            chunks: sseChunkCount,
-                            contentChars: streamedContent.length,
-                            reasoningChars: streamedReasoning.length,
-                            totalMs: Date.now() - requestStartedAt,
-                            toolCalls: collected?.toolCalls?.length || 0,
-                            permissions: collected?.permissions || 0,
-                            autoApproved: collected?.autoApproved || 0,
-                            finishReason: 'stop'
-                        });
-                        logger.debug('[Proxy] Upstream response (stream full text)', {
-                            reqId,
-                            sessionId,
-                            content: streamedContent,
-                            reasoning: streamedReasoning
-                        });
-                    } else {
-                        /* 非流式也要订阅事件流: 自动批准 permission(否则工具任务会一直等到超时) + 输出工具活动日志 */
-                        phase = 'prompt';
-                        const collector = collectSessionEvents({
-                            client,
-                            sessionId,
-                            reqId,
-                            timeoutMs: REQUEST_TIMEOUT_MS,
-                            firstDeltaTimeoutMs: 0,
-                            idleTimeoutMs: 0,
-                            autoApprovePermission: OPENCODE_AUTO_APPROVE,
-                            directory: workdir
-                        });
-                        let pollResult = null;
-                        try {
-                            await collector.ready;
-                            const promptStart = Date.now();
-                            const promptResult = await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
-                            assertNoUpstreamError(promptResult, 'Send prompt');
-                            logger.info('[Proxy] Prompt sent', {
-                                reqId,
-                                sessionId,
-                                ms: Date.now() - promptStart,
-                                parts: parts.length,
-                                systemChars: systemWithGuard ? systemWithGuard.length : 0
-                            });
-                            phase = 'poll';
-                            pollResult = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
-                        } finally {
-                            collector.abort();
-                        }
-                        const { content, reasoning, error } = pollResult;
-                        if (error && !content && !reasoning) {
-                            return res.status(502).json({
-                                error: {
-                                    message: error.data?.message || error.message || 'OpenCode provider error',
-                                    type: error.name || 'OpenCodeError'
-                                }
-                            });
-                        }
-                        const safeContent = stripFunctionCalls(content);
-                        const safeReasoning = stripFunctionCalls(reasoning);
-
-                        const responsePayload = {
-                            id: `chatcmpl-${Date.now()}`,
-                            object: 'chat.completion',
-                            created: Math.floor(Date.now() / 1000),
-                            model: `${pID}/${mID}`,
-                            choices: [{
-                                index: 0,
-                                message: { role: 'assistant', content: safeContent, reasoning_content: safeReasoning || null },
-                                finish_reason: 'stop'
-                            }],
-                            usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
-                        };
-                        logger.info('[Proxy] Request completed', {
-                            reqId,
-                            sessionId,
-                            model: `${pID}/${mID}`,
-                            stream: false,
-                            contentChars: safeContent.length,
-                            reasoningChars: safeReasoning.length,
-                            totalMs: Date.now() - requestStartedAt,
-                            toolCalls: collector.state.toolCalls.size,
-                            permissions: collector.state.permissions,
-                            autoApproved: collector.state.autoApproved,
-                            finishReason: 'stop'
-                        });
-                        logger.debug('Upstream response (non-stream full JSON)', {
-                            reqId,
-                            sessionId,
-                            response: responsePayload
-                        });
-                        res.json(responsePayload);
-                    }
-                } catch (error) {
-                    // 上游(opencode serve)调用链失败: error 级必输出, 含停在哪一阶段/状态码/错误体摘要; 完整错误对象放 debug 级
-                    const upstream = extractUpstreamError(error);
-                    const isTimeout = Boolean(error.message && error.message.includes('Request timeout'));
-                    if (isTimeout) {
-                        logger.warn('[Proxy] Request timed out (stuck phase)', {
-                            reqId,
-                            sessionId,
-                            phase,
-                            elapsedMs: Date.now() - requestStartedAt,
-                            timeoutMs: REQUEST_TIMEOUT_MS
-                        });
-                    }
-                    logger.error('[Proxy] API Error (upstream call failed)', {
-                        reqId,
-                        sessionId,
-                        phase,
-                        elapsedMs: Date.now() - requestStartedAt,
-                        message: error.message,
-                        status: upstream.status,
-                        retryAfter: upstream.retryAfter,
-                        bodySummary: upstream.bodySummary
-                    });
-                    logger.debug('[Proxy] Error details', { reqId, sessionId, phase, error });
-
-                    if (!res.headersSent) {
-                        let errorMessage = error.message;
-                        let statusCode = 500;
-                        if (error.message && error.message.includes('Request timeout')) {
-                            statusCode = 504;
-                        }
-                        if (error.message && error.message.includes('ENOENT')) {
-                            errorMessage = 'OpenCode backend file access error. This may be a Windows compatibility issue. Please try restarting the service.';
-                        }
-                        res.status(statusCode).json({
-                            error: {
-                                message: errorMessage,
-                                type: error.constructor.name
-                            }
-                        });
-                    } else if (!res.writableEnded) {
-                        /* 流式已开始(响应头已发)后出错: 主动结束 SSE, 避免客户端一直挂着等数据 */
-                        res.end();
-                    }
-                    if (sessionId) {
-                        try {
-                            await client.session.delete({ path: { id: sessionId } });
-                        } catch (e) {
-                            logger.warn('[Proxy] Failed to cleanup session on error:', { sessionId, error: e.message });
-                        }
-                    }
-                }
-            }, REQUEST_TIMEOUT_MS + 20000);
+            await serialQueue.enqueue(
+                () => handleChatCompletion(req, res, reqId, enqueuedAt),
+                { timeoutMs: REQUEST_TIMEOUT_MS + 20000, reqId }
+            );
         } catch (error) {
-            logger.error('[Proxy] Request Handler Error:', { message: error.message, stack: error.stack });
+            if (isQueueTimeoutError(error)) {
+                /* 排队超过 QUEUE_MAX_WAIT_MS: 直接 503, 不再陪着一个卡住的上游请求干等 */
+                logger.warn('[Proxy] Queue wait timeout, request rejected', {
+                    reqId,
+                    waitedMs: error.waitedMs,
+                    maxWaitMs: error.maxWaitMs,
+                    queueLength: serialQueue.length,
+                    inflight: inflight.size
+                });
+                const queueFailure = buildQueueTimeoutResponse(error);
+                if (!res.headersSent) {
+                    res.status(queueFailure.status).json(queueFailure.body);
+                } else if (!res.writableEnded) {
+                    res.end();
+                }
+                return;
+            }
+            logger.error('[Proxy] Request Handler Error:', { reqId, message: error.message, stack: error.stack });
             if (!res.headersSent) {
                 res.status(500).json({ error: { message: error.message, type: error.constructor.name } });
             }
+        } finally {
+            /* 完成/失败/超时/快速失败都必须从在途注册表移除(finally 保证) */
+            inflight.remove(reqId);
         }
+    });
+
+    /**
+     * 处理一次 chat completion(在单并发队列里执行)
+     * @param {object} req Express 请求
+     * @param {object} res Express 响应
+     * @param {string|null} reqId 请求 id
+     * @param {number} enqueuedAt 入队时间(用于排队时长)
+     */
+    async function handleChatCompletion(req, res, reqId, enqueuedAt) {
+        let sessionId = null;
+        let workdir = null;
+        let phase = 'init';
+        const requestStartedAt = Date.now();
+
+        /* 阶段切换同时更新在途注册表(R4 进度日志 / R5 在途查询都靠它) */
+        const setPhase = (next) => {
+            phase = next;
+            inflight.update(reqId, { phase: next });
+        };
+
+        /* 事件收集统一配置: 输出侧防回显 + 限流快速失败 + 活动上报(进度日志/看门狗) */
+        const collectorOptions = (overrides = {}) => ({
+            client,
+            sessionId,
+            reqId,
+            timeoutMs: REQUEST_TIMEOUT_MS,
+            firstDeltaTimeoutMs: DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
+            idleTimeoutMs: EVENT_IDLE_TIMEOUT_MS,
+            autoApprovePermission: OPENCODE_AUTO_APPROVE,
+            directory: workdir,
+            echoPatterns,
+            fastFailRetryMs: FAST_FAIL_RETRY_MS,
+            onActivity: (activity) => {
+                inflight.update(reqId, { lastEvent: activity.type, deltaChars: activity.deltaChars });
+            },
+            ...overrides
+        });
+
+        /* 流式分支的快速失败: 先发一条 SSE error 事件(OpenAI 兼容格式), 再正常结束连接 */
+        const sendStreamFastFail = (writeSse, streamedContent, fastFailInfo, modelLabel) => {
+            const failure = buildRetryFailure(fastFailInfo);
+            writeSse(`data: ${JSON.stringify(failure.body)}\n\n`);
+            writeSse('data: [DONE]\n\n');
+            logger.warn('[Proxy] Request fast-failed on upstream retry', {
+                reqId,
+                sessionId,
+                model: modelLabel,
+                stream: true,
+                elapsedMs: Date.now() - requestStartedAt,
+                nextInMs: fastFailInfo.nextInMs,
+                retryAfterMs: failure.body.error.retry_after_ms,
+                message: fastFailInfo.message,
+                reason: fastFailInfo.reason,
+                keyword: fastFailInfo.keyword || null,
+                deltaChars: streamedContent ? streamedContent.length : 0
+            });
+        };
+
+        try {
+            const queueWaitMs = Date.now() - enqueuedAt;
+            if (queueWaitMs > 0) {
+                logger.info('[Proxy] Queue wait', { reqId, waitedMs: queueWaitMs, queueLength: serialQueue.length });
+            }
+            logger.debug('Incoming OpenAI request', {
+                reqId,
+                method: req.method,
+                path: req.originalUrl,
+                headers: maskHeaders(req.headers),
+                body: req.body
+            });
+            const { messages, model, stream } = req.body;
+            if (!messages || !Array.isArray(messages) || messages.length === 0) {
+                return res.status(400).json({ error: { message: 'messages array is required' } });
+            }
+
+            let [pID, mID] = (model || 'opencode/kimi-k2.5-free').split('/');
+            if (!mID) { mID = pID; pID = 'opencode'; }
+            const modelLabel = `${pID}/${mID}`;
+            if (req.gatewayLog) {
+                req.gatewayLog.model = modelLabel;
+                req.gatewayLog.stream = Boolean(stream);
+            }
+            /* 模型/流式标记尽早写进在途注册表, 排队/执行阶段都能查出来是谁 */
+            inflight.update(reqId, { model: modelLabel, stream: Boolean(stream), queueWaitMs });
+
+            /* 系统提示词分离: role=system 进 body.system; 命中规则的 user 消息也提升到 body.system, 不拼进 parts */
+            const built = buildPromptMessages(messages, promptPatterns.disabled ? [] : promptPatterns.patterns);
+            const { parts, system: systemMsg, lastUserMsg, stats: promptStats } = built;
+            const systemWithGuard = applyToolGuard(systemMsg);
+
+            /* info 级默认输出"收到请求": 即使后面卡住, 也能看到请求确实进来了 */
+            logger.info('[Proxy] Request received', {
+                reqId,
+                model: modelLabel,
+                stream: Boolean(stream),
+                messages: messages.length,
+                lastUser: previewText(lastUserMsg, 120),
+                hasSystem: Boolean(systemWithGuard),
+                systemChars: systemWithGuard ? systemWithGuard.length : 0,
+                promotedSystemMessages: promptStats.promotedCount,
+                promotedChars: promptStats.promotedChars,
+                parts: parts.length
+            });
+
+            if (!parts.length) {
+                return res.status(400).json({ error: { message: 'messages must include at least one non-system text message' } });
+            }
+            logDebug('Request start', {
+                model: modelLabel,
+                stream: Boolean(stream),
+                userMessages: messages.length,
+                system: Boolean(systemMsg),
+                lastUserLength: lastUserMsg.length,
+                parts: parts.length,
+                disableTools: DISABLE_TOOLS,
+                promptStats
+            });
+            if (promptStats.promotedCount > 0) {
+                logger.debug('[Proxy] System prompt messages promoted out of user parts', {
+                    reqId,
+                    promotedCount: promptStats.promotedCount,
+                    promotedChars: promptStats.promotedChars,
+                    systemChars: systemWithGuard ? systemWithGuard.length : 0
+                });
+            }
+
+            // Ensure backend is running(阶段日志: 后端就绪 + 耗时)
+            setPhase('backend');
+            const backendStartedAt = Date.now();
+            const backend = await ensureBackend(config);
+            workdir = OPENCODE_WORKDIR || backend?.workdir || null;
+            logger.info('[Proxy] Backend ready', {
+                reqId,
+                ms: Date.now() - backendStartedAt,
+                spawned: Boolean(backend?.spawnedThisTime),
+                workdir: workdir || null
+            });
+
+            // Create session(在 OPENCODE_WORKDIR 指定的目录里干活; 未配置时用 jail 空目录)
+            setPhase('session');
+            const sessionStartedAt = Date.now();
+            const sessionParams = workdir ? { query: { directory: workdir } } : {};
+            const sessionRes = await client.session.create(sessionParams);
+            assertNoUpstreamError(sessionRes, 'Create OpenCode session');
+            sessionId = sessionRes.data?.id;
+            if (!sessionId) throw new Error('Failed to create OpenCode session (no session id in response)');
+            inflight.update(reqId, { sessionId });
+            logger.info('[Proxy] Session created', {
+                reqId,
+                sessionId,
+                ms: Date.now() - sessionStartedAt,
+                workdir: workdir || null
+            });
+
+            const promptParams = {
+                path: { id: sessionId },
+                body: {
+                    model: { providerID: pID, modelID: mID },
+                    system: systemWithGuard,
+                    parts: parts
+                }
+            };
+            if (workdir) promptParams.query = { directory: workdir };
+            const toolOverrides = await getToolOverrides();
+            if (toolOverrides && Object.keys(toolOverrides).length > 0) {
+                promptParams.body.tools = toolOverrides;
+            }
+            logger.debug('Upstream payload (final request body to opencode serve)', summarizeUpstreamPayload(promptParams, {
+                reqId,
+                sessionId,
+                model: modelLabel,
+                disableTools: DISABLE_TOOLS
+            }));
+
+            if (stream) {
+                res.setHeader('Content-Type', 'text/event-stream');
+                res.setHeader('Cache-Control', 'no-cache');
+                const id = `chatcmpl-${Date.now()}`;
+                const filterContentDelta = createToolCallFilter();
+                const filterReasoningDelta = createToolCallFilter();
+                let streamedContent = '';
+                let streamedReasoning = '';
+                let sseChunkCount = 0;
+
+                let clientGone = false;
+                res.on('close', () => { clientGone = true; });
+                const writeSse = (text) => {
+                    if (clientGone || res.writableEnded) return false;
+                    res.write(text);
+                    return true;
+                };
+
+                /* 心跳: 长任务期间定期发 SSE 注释(: ping), 避免客户端/中间层把连接当空闲断开。
+                   响应结束/客户端断开/异常路径都会清理, 不依赖业务代码走到固定位置 */
+                const heartbeatId = setInterval(() => {
+                    writeSse(': ping\n\n');
+                }, SSE_HEARTBEAT_MS);
+                if (typeof heartbeatId.unref === 'function') heartbeatId.unref();
+                res.on('finish', () => clearInterval(heartbeatId));
+                res.on('close', () => clearInterval(heartbeatId));
+
+                const sendDelta = (delta, isReasoning = false) => {
+                    if (!delta) return;
+                    const filtered = isReasoning ? filterReasoningDelta(delta) : filterContentDelta(delta);
+                    if (!filtered) return;
+                    if (isReasoning) {
+                        streamedReasoning += filtered;
+                    } else {
+                        streamedContent += filtered;
+                    }
+                    const chunk = {
+                        id,
+                        object: 'chat.completion.chunk',
+                        created: Math.floor(Date.now() / 1000),
+                        model: modelLabel,
+                        choices: [{ index: 0, delta: {}, finish_reason: null }]
+                    };
+                    if (isReasoning) {
+                        chunk.choices[0].delta.reasoning_content = filtered;
+                    } else {
+                        chunk.choices[0].delta.content = filtered;
+                    }
+                    if (writeSse(`data: ${JSON.stringify(chunk)}\n\n`)) sseChunkCount++;
+                };
+
+                /* 可选: 把 opencode 工具进度作为 SSE 注释行输出(默认关闭; 注释行不影响客户端解析) */
+                const onToolActivity = OPENCODE_STREAM_TOOLS
+                    ? (activity) => {
+                        const label = activity.tool ? `${activity.tool} ${activity.status}` : activity.status;
+                        const detail = activity.input || activity.output || activity.error || '';
+                        writeSse(`: tool ${label}${detail ? ` - ${detail}` : ''}\n\n`);
+                    }
+                    : null;
+
+                const collector = collectSessionEvents(collectorOptions({ onDelta: sendDelta, onTool: onToolActivity }));
+                let collected = null;
+                let fastFailInfo = null;
+                setPhase('prompt');
+                try {
+                    await collector.ready;
+                    /* 订阅阶段就可能收到 retry 快速失败: 已经失败就不要再发 prompt 了 */
+                    fastFailInfo = fastFailInfo || collector.getFastFail();
+                    if (!fastFailInfo) {
+                        const promptStart = Date.now();
+                        try {
+                            /* promptWithTimeout 会同时 race 快速失败信号: 上游额度耗尽时立即返回, 不等 300s */
+                            const promptResult = await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS, collector.fastFailPromise);
+                            assertNoUpstreamError(promptResult, 'Send prompt');
+                            logger.info('[Proxy] Prompt sent', {
+                                reqId,
+                                sessionId,
+                                ms: Date.now() - promptStart,
+                                parts: parts.length,
+                                systemChars: systemWithGuard ? systemWithGuard.length : 0
+                            });
+                        } catch (error) {
+                            if (isUpstreamRetryError(error)) {
+                                fastFailInfo = error.info;
+                            } else {
+                                throw error;
+                            }
+                        }
+                    }
+                    if (!fastFailInfo) {
+                        setPhase('collect');
+                        collected = await collector.promise;
+                        if (collected && collected.fastFail) fastFailInfo = collected.fastFail;
+                    }
+                } finally {
+                    collector.abort();
+                }
+
+                if (fastFailInfo) {
+                    sendStreamFastFail(writeSse, streamedContent, fastFailInfo, modelLabel);
+                    if (!res.writableEnded) res.end();
+                    await deleteSessionQuietly(sessionId, reqId);
+                    return;
+                }
+
+                /* 兜底轮询: 轮询期间收到 retry 快速失败时转成 fastFailInfo, 走同样的 SSE error 收尾 */
+                const pollFallback = () => pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS, DEFAULT_POLL_INTERVAL_MS, {
+                    getFastFail: collector.getFastFail,
+                    reqId
+                });
+
+                try {
+                    if (!collected || collected.error || collected.timedOut) {
+                        logger.debug('SSE collect error, falling back to polling', {
+                            sessionId,
+                            error: collected?.error?.message || null,
+                            reason: collected?.reason || 'none'
+                        });
+                        const { content, reasoning, error } = await pollFallback();
+                        if (error && !content && !reasoning) {
+                            sendDelta(`[Proxy Error] ${error.name || 'OpenCodeError'}: ${error.data?.message || error.message || 'Unknown error'}`);
+                        } else {
+                            const safeReasoning = stripFunctionCalls(reasoning, false);
+                            const safeContent = stripFunctionCalls(content, false);
+                            if (safeReasoning) sendDelta(safeReasoning, true);
+                            if (safeContent) sendDelta(safeContent, false);
+                        }
+                    } else if (collected && collected.noData) {
+                        logDebug('Fallback to polling (stream)', { sessionId });
+                        const { content, reasoning, error } = await pollFallback();
+                        if (error && !content && !reasoning) {
+                            sendDelta(`[Proxy Error] ${error.name || 'OpenCodeError'}: ${error.data?.message || error.message || 'Unknown error'}`);
+                        } else {
+                            const safeReasoning = stripFunctionCalls(reasoning, false);
+                            const safeContent = stripFunctionCalls(content, false);
+                            if (safeReasoning) sendDelta(safeReasoning, true);
+                            if (safeContent) sendDelta(safeContent, false);
+                        }
+                    } else if (collected && collected.idleTimeout) {
+                        logDebug('SSE idle timeout, polling for completion', { sessionId });
+                        const { content, reasoning, error } = await pollFallback();
+                        if (error && !content && !reasoning) {
+                            sendDelta(`[Proxy Error] ${error.name || 'OpenCodeError'}: ${error.data?.message || error.message || 'Unknown error'}`);
+                        } else {
+                            const safeReasoning = stripFunctionCalls(reasoning, false);
+                            const safeContent = stripFunctionCalls(content, false);
+                            const remainingReasoning = safeReasoning && safeReasoning.startsWith(streamedReasoning)
+                                ? safeReasoning.slice(streamedReasoning.length)
+                                : safeReasoning;
+                            const remainingContent = safeContent && safeContent.startsWith(streamedContent)
+                                ? safeContent.slice(streamedContent.length)
+                                : safeContent;
+                            if (remainingReasoning) sendDelta(remainingReasoning, true);
+                            if (remainingContent) sendDelta(remainingContent, false);
+                        }
+                    }
+
+                    /* opencode>=1.19 SSE delta 缺失时 assistant 快速 finish 会带空内容提前 resolve, 这里兜底轮询一次取完整回复再下发, 轮询也无内容则不发任何 delta */
+                    if (collected && !streamedContent && !streamedReasoning) {
+                        const { content: polledContent, reasoning: polledReasoning } = await pollFallback();
+                        const safePolledReasoning = stripFunctionCalls(polledReasoning, false);
+                        const safePolledContent = stripFunctionCalls(polledContent, false);
+                        if (safePolledReasoning) sendDelta(safePolledReasoning, true);
+                        if (safePolledContent) sendDelta(safePolledContent, false);
+                    }
+                } catch (error) {
+                    if (isUpstreamRetryError(error)) {
+                        sendStreamFastFail(writeSse, streamedContent, error.info, modelLabel);
+                        if (!res.writableEnded) res.end();
+                        await deleteSessionQuietly(sessionId, reqId);
+                        return;
+                    }
+                    throw error;
+                }
+
+                if (writeSse(`data: ${JSON.stringify({ id, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`)) sseChunkCount++;
+                writeSse('data: [DONE]\n\n');
+                res.end();
+                logger.info('[Proxy] Request completed', {
+                    reqId,
+                    sessionId,
+                    model: modelLabel,
+                    stream: true,
+                    chunks: sseChunkCount,
+                    contentChars: streamedContent.length,
+                    reasoningChars: streamedReasoning.length,
+                    echoRemovedChars: (collected && collected.echoRemovedChars) || 0,
+                    totalMs: Date.now() - requestStartedAt,
+                    toolCalls: collected?.toolCalls?.length || 0,
+                    permissions: collected?.permissions || 0,
+                    autoApproved: collected?.autoApproved || 0,
+                    finishReason: 'stop'
+                });
+                logger.debug('[Proxy] Upstream response (stream full text)', {
+                    reqId,
+                    sessionId,
+                    content: streamedContent,
+                    reasoning: streamedReasoning
+                });
+            } else {
+                /* 非流式也要订阅事件流: 自动批准 permission(否则工具任务会一直等到超时) + 输出工具活动日志。
+                   非流式不关心首包/空闲超时(旧实现就是 0), 否则工具阶段 4s 无文本增量就会提前中断事件流 */
+                setPhase('prompt');
+                const collector = collectSessionEvents(collectorOptions({ firstDeltaTimeoutMs: 0, idleTimeoutMs: 0 }));
+                let pollResult = null;
+                let fastFailInfo = null;
+                try {
+                    await collector.ready;
+                    /* 订阅阶段就可能收到 retry 快速失败: 已经失败就不要再发 prompt / 轮询了 */
+                    fastFailInfo = fastFailInfo || collector.getFastFail();
+                    if (!fastFailInfo) {
+                        const promptStart = Date.now();
+                        try {
+                            const promptResult = await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS, collector.fastFailPromise);
+                            assertNoUpstreamError(promptResult, 'Send prompt');
+                            logger.info('[Proxy] Prompt sent', {
+                                reqId,
+                                sessionId,
+                                ms: Date.now() - promptStart,
+                                parts: parts.length,
+                                systemChars: systemWithGuard ? systemWithGuard.length : 0
+                            });
+                            setPhase('poll');
+                            pollResult = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS, DEFAULT_POLL_INTERVAL_MS, {
+                                getFastFail: collector.getFastFail,
+                                reqId
+                            });
+                        } catch (error) {
+                            if (isUpstreamRetryError(error)) {
+                                fastFailInfo = error.info;
+                            } else {
+                                throw error;
+                            }
+                        }
+                    }
+                } finally {
+                    collector.abort();
+                }
+                if (!fastFailInfo) {
+                    fastFailInfo = collector.getFastFail();
+                }
+                if (fastFailInfo) {
+                    const failure = buildRetryFailure(fastFailInfo);
+                    logger.warn('[Proxy] Request fast-failed on upstream retry', {
+                        reqId,
+                        sessionId,
+                        model: modelLabel,
+                        stream: false,
+                        elapsedMs: Date.now() - requestStartedAt,
+                        nextInMs: fastFailInfo.nextInMs,
+                        retryAfterMs: failure.body.error.retry_after_ms,
+                        message: fastFailInfo.message,
+                        reason: fastFailInfo.reason,
+                        keyword: fastFailInfo.keyword || null
+                    });
+                    await deleteSessionQuietly(sessionId, reqId);
+                    return res.status(failure.status).json(failure.body);
+                }
+                const { content, reasoning, error } = pollResult;
+                if (error && !content && !reasoning) {
+                    return res.status(502).json({
+                        error: {
+                            message: error.data?.message || error.message || 'OpenCode provider error',
+                            type: error.name || 'OpenCodeError'
+                        }
+                    });
+                }
+                /* 输出侧兜底: 上游把 user/system 内容当 assistant part 回显时裁掉, 响应里只留真正的 assistant 内容 */
+                const safeContent = stripFunctionCalls(sanitizeAssistantOutput(content, { reqId, sessionId, channel: 'content', source: 'poll' }));
+                const safeReasoning = stripFunctionCalls(sanitizeAssistantOutput(reasoning, { reqId, sessionId, channel: 'reasoning', source: 'poll' }));
+
+                const responsePayload = {
+                    id: `chatcmpl-${Date.now()}`,
+                    object: 'chat.completion',
+                    created: Math.floor(Date.now() / 1000),
+                    model: modelLabel,
+                    choices: [{
+                        index: 0,
+                        message: { role: 'assistant', content: safeContent, reasoning_content: safeReasoning || null },
+                        finish_reason: 'stop'
+                    }],
+                    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+                };
+                logger.info('[Proxy] Request completed', {
+                    reqId,
+                    sessionId,
+                    model: modelLabel,
+                    stream: false,
+                    contentChars: safeContent.length,
+                    reasoningChars: safeReasoning.length,
+                    totalMs: Date.now() - requestStartedAt,
+                    toolCalls: collector.state.toolCalls.size,
+                    permissions: collector.state.permissions,
+                    autoApproved: collector.state.autoApproved,
+                    finishReason: 'stop'
+                });
+                logger.debug('Upstream response (non-stream full JSON)', {
+                    reqId,
+                    sessionId,
+                    response: responsePayload
+                });
+                res.json(responsePayload);
+            }
+        } catch (error) {
+            // 上游(opencode serve)调用链失败: error 级必输出, 含停在哪一阶段/状态码/错误体摘要; 完整错误对象放 debug 级
+            const upstream = extractUpstreamError(error);
+            const isTimeout = Boolean(error.message && error.message.includes('Request timeout'));
+            if (isTimeout) {
+                logger.warn('[Proxy] Request timed out (stuck phase)', {
+                    reqId,
+                    sessionId,
+                    phase,
+                    elapsedMs: Date.now() - requestStartedAt,
+                    timeoutMs: REQUEST_TIMEOUT_MS
+                });
+            }
+            logger.error('[Proxy] API Error (upstream call failed)', {
+                reqId,
+                sessionId,
+                phase,
+                elapsedMs: Date.now() - requestStartedAt,
+                message: error.message,
+                status: upstream.status,
+                retryAfter: upstream.retryAfter,
+                bodySummary: upstream.bodySummary
+            });
+            logger.debug('[Proxy] Error details', { reqId, sessionId, phase, error });
+
+            if (!res.headersSent) {
+                let errorMessage = error.message;
+                let statusCode = 500;
+                if (error.message && error.message.includes('Request timeout')) {
+                    statusCode = 504;
+                }
+                if (error.message && error.message.includes('ENOENT')) {
+                    errorMessage = 'OpenCode backend file access error. This may be a Windows compatibility issue. Please try restarting the service.';
+                }
+                res.status(statusCode).json({
+                    error: {
+                        message: errorMessage,
+                        type: error.constructor.name
+                    }
+                });
+            } else if (!res.writableEnded) {
+                /* 流式已开始(响应头已发)后出错: 主动结束 SSE, 避免客户端一直挂着等数据 */
+                res.end();
+            }
+            await deleteSessionQuietly(sessionId, reqId);
+        }
+    }
+
+    /* 在途请求查询: 鉴权与其它 /v1 接口一致(走同一个 API_KEY 中间件), 返回当前执行中的请求 */
+    app.get('/v1/gateway/inflight', (req, res) => {
+        res.json(inflight.snapshot());
     });
 
     // Health check
     app.get('/health', (req, res) => res.json({
         status: 'ok',
-        backend: OPENCODE_SERVER_URL
+        backend: OPENCODE_SERVER_URL,
+        inflight: inflight.size
     }));
 
-    return { app, client };
+    return { app, client, inflight, serialQueue };
 }
 
 // Backend management state (per-instance)
@@ -1312,6 +1496,13 @@ export function startProxy(options) {
         return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
     };
 
+    /* 允许 0 的数值配置: 0 表示关闭对应能力(如 FAST_FAIL_RETRY_MS=0 关闭快速失败阈值) */
+    const nonNegativeNumber = (value, fallback) => {
+        if (value === undefined || value === null || String(value).trim() === '') return fallback;
+        const parsed = Number(value);
+        return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+    };
+
     const config = {
         PORT: options.PORT || 8083,
         API_KEY: options.API_KEY || '',
@@ -1354,6 +1545,14 @@ export function startProxy(options) {
         SYSTEM_PROMPT_PATTERNS: resolvePatternsOption(options.SYSTEM_PROMPT_PATTERNS),
         EVENT_IDLE_TIMEOUT_MS: positiveNumber(options.EVENT_IDLE_TIMEOUT_MS ?? process.env.OPENCODE_EVENT_IDLE_TIMEOUT_MS, DEFAULT_EVENT_IDLE_TIMEOUT_MS),
         SSE_HEARTBEAT_MS: positiveNumber(options.SSE_HEARTBEAT_MS ?? process.env.OPENCODE_SSE_HEARTBEAT_MS, DEFAULT_SSE_HEARTBEAT_MS),
+        /* 上游 retry(nextInMs 超阈值或额度类文案)快速失败, 不再等满 REQUEST_TIMEOUT_MS; 0=关闭阈值判断 */
+        FAST_FAIL_RETRY_MS: nonNegativeNumber(options.FAST_FAIL_RETRY_MS ?? process.env.FAST_FAIL_RETRY_MS, DEFAULT_FAST_FAIL_RETRY_MS),
+        /* 单并发队列的排队上限: 超过直接 503, 避免上游卡住时排队雪崩; 0=不限制 */
+        QUEUE_MAX_WAIT_MS: nonNegativeNumber(options.QUEUE_MAX_WAIT_MS ?? process.env.QUEUE_MAX_WAIT_MS, DEFAULT_QUEUE_MAX_WAIT_MS),
+        /* 在途请求进度日志间隔; 0=关闭 */
+        PROGRESS_LOG_INTERVAL_MS: nonNegativeNumber(options.PROGRESS_LOG_INTERVAL_MS ?? process.env.PROGRESS_LOG_INTERVAL_MS, DEFAULT_PROGRESS_LOG_INTERVAL_MS),
+        /* 看门狗判定"卡住"的阈值(超过这么久没有活动就 WARN); 0=关闭 */
+        STALL_WARN_MS: nonNegativeNumber(options.STALL_WARN_MS ?? process.env.STALL_WARN_MS, DEFAULT_STALL_WARN_MS),
         DEBUG: String(options.DEBUG || '').toLowerCase() === 'true' ||
             options.DEBUG === '1' ||
             String(process.env.OPENCODE_PROXY_DEBUG || '').toLowerCase() === 'true' ||
@@ -1378,7 +1577,7 @@ export function startProxy(options) {
         ? (config.DEBUG ? 'legacy DEBUG flag' : 'default')
         : (levelSourceHint || 'LOG_LEVEL');
 
-    const { app } = createApp(config);
+    const { app, inflight } = createApp(config);
 
     /* 可选: tail opencode 日志文件(新行 debug 级转发), 作为"实时看到 opencode 在干什么"的第二路信息 */
     let logTail = null;
@@ -1402,7 +1601,11 @@ export function startProxy(options) {
             tailOpencodeLog: Boolean(logTail),
             requestTimeoutMs: config.REQUEST_TIMEOUT_MS,
             eventIdleTimeoutMs: config.EVENT_IDLE_TIMEOUT_MS,
-            sseHeartbeatMs: config.SSE_HEARTBEAT_MS
+            sseHeartbeatMs: config.SSE_HEARTBEAT_MS,
+            fastFailRetryMs: config.FAST_FAIL_RETRY_MS,
+            queueMaxWaitMs: config.QUEUE_MAX_WAIT_MS,
+            progressLogIntervalMs: config.PROGRESS_LOG_INTERVAL_MS,
+            stallWarnMs: config.STALL_WARN_MS
         });
         try {
             await ensureBackend(config);
@@ -1410,6 +1613,9 @@ export function startProxy(options) {
             logger.error('[Proxy] Backend warmup failed:', { error: error.message });
         }
     });
+
+    /* 服务关闭时清理在途注册表的定时器(看门狗 + 每请求进度定时器), 不泄漏 */
+    server.on('close', () => inflight.stop());
 
     return {
         server,

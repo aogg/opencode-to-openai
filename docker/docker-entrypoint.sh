@@ -5,6 +5,7 @@
 # 支持(写入 config.json): PORT API_KEY BIND_HOST DISABLE_TOOLS OPENCODE_PATH OPENCODE_SERVER_URL OPENCODE_BIND_HOST
 #   OPENCODE_AUTO_APPROVE OPENCODE_WORKDIR OPENCODE_STREAM_TOOLS OPENCODE_LOG_TAIL OPENCODE_LOG_FILE
 #   OPENCODE_PRINT_LOGS SYSTEM_PROMPT_PATTERNS REQUEST_TIMEOUT_MS OPENCODE_EVENT_IDLE_TIMEOUT_MS OPENCODE_SSE_HEARTBEAT_MS
+#   FAST_FAIL_RETRY_MS QUEUE_MAX_WAIT_MS PROGRESS_LOG_INTERVAL_MS STALL_WARN_MS
 # 日志等级 LOG_LEVEL(error/warn/info/debug, 不区分大小写)不写入 config.json:
 #   由 node 进程直接读取环境变量生效, 优先级高于 config.json 里的 LOG_LEVEL 字段, 未设置时默认 info;
 #   CLI --log-level 优先级最高(可用 `docker run ... adockero/opencode-to-openai node index.js --log-level debug` 覆盖 CMD)
@@ -19,6 +20,7 @@ if [ ! -f "$CONFIG" ]; then
         const env = (k, d) => { const v = process.env[k]; return (v === undefined || v === "") ? d : v; };
         const flag = (k, d) => { const v = env(k, d); return v === "true" || v === "1"; };
         const num = (k, d) => { const n = Number(env(k, "")); return Number.isFinite(n) && n > 0 ? n : d; };
+        const nonNeg = (k, d) => { const raw = env(k, ""); if (raw === "") return d; const n = Number(raw); return Number.isFinite(n) && n >= 0 ? n : d; };
         const cfg = {
             PORT: parseInt(env("PORT", "8083"), 10),
             API_KEY: env("API_KEY", ""),
@@ -36,7 +38,11 @@ if [ ! -f "$CONFIG" ]; then
             SYSTEM_PROMPT_PATTERNS: env("SYSTEM_PROMPT_PATTERNS", ""),
             REQUEST_TIMEOUT_MS: num("REQUEST_TIMEOUT_MS", 300000),
             OPENCODE_EVENT_IDLE_TIMEOUT_MS: num("OPENCODE_EVENT_IDLE_TIMEOUT_MS", 60000),
-            OPENCODE_SSE_HEARTBEAT_MS: num("OPENCODE_SSE_HEARTBEAT_MS", 15000)
+            OPENCODE_SSE_HEARTBEAT_MS: num("OPENCODE_SSE_HEARTBEAT_MS", 15000),
+            FAST_FAIL_RETRY_MS: nonNeg("FAST_FAIL_RETRY_MS", 60000),
+            QUEUE_MAX_WAIT_MS: nonNeg("QUEUE_MAX_WAIT_MS", 60000),
+            PROGRESS_LOG_INTERVAL_MS: nonNeg("PROGRESS_LOG_INTERVAL_MS", 300000),
+            STALL_WARN_MS: nonNeg("STALL_WARN_MS", 300000)
         };
         fs.writeFileSync("/app/config.json", JSON.stringify(cfg, null, 4));
         console.log("[entrypoint] first boot, config generated from env:", JSON.stringify(cfg));

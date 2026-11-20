@@ -131,7 +131,10 @@ For real (multi-step, tool-using) projects also set:
 - `OPENCODE_WORKDIR`: the directory opencode should work in (defaults to an isolated empty jail dir);
 - `OPENCODE_AUTO_APPROVE` (default `true`): auto-approve opencode permission requests so tool tasks do not hang;
 - `SYSTEM_PROMPT_PATTERNS`: user messages that are really system prompts (dsh role injection, project system prompt, `<system-reminder>`, ...) are promoted to `body.system` instead of being mixed into user parts. Set `none` to disable;
-- `REQUEST_TIMEOUT_MS`, `OPENCODE_STREAM_TOOLS`, `OPENCODE_LOG_TAIL`, `OPENCODE_PRINT_LOGS` as needed.
+- `REQUEST_TIMEOUT_MS`, `OPENCODE_STREAM_TOOLS`, `OPENCODE_LOG_TAIL`, `OPENCODE_PRINT_LOGS` as needed;
+- `FAST_FAIL_RETRY_MS` (default `60000`): fail fast with HTTP 429 when upstream `session.status=retry` asks to wait longer, or the message is a quota/rate-limit message; `0` disables the wait threshold;
+- `QUEUE_MAX_WAIT_MS` (default `60000`): reject queued requests with HTTP 503 after this wait; `0` = unlimited;
+- `PROGRESS_LOG_INTERVAL_MS` (default `300000`) / `STALL_WARN_MS` (default `300000`): per-request progress logs and the stalled-request watchdog; inspect live requests at `GET /v1/gateway/inflight` (same API key auth).
 
 Log level: `node index.js --log-level debug` (CLI) > `LOG_LEVEL=debug` (env) > `config.json` `LOG_LEVEL` > legacy `DEBUG` flag > default `info`. See [docker/README.md](./docker/README.md#日志等级怎么设置cli--env-configjson) for the full matrix.
 

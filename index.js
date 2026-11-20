@@ -26,6 +26,13 @@ function parseOptionalPositiveNumber(value) {
     return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
 }
 
+/** 非负数值解析: 允许 0(0=关闭对应能力), 空/非法时返回 undefined 交给 proxy 内置默认值兜底 */
+function parseOptionalNonNegativeNumber(value) {
+    if (value === undefined || value === null || String(value).trim() === '') return undefined;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
 // CLI 参数解析(目前只关心 --log-level / --help; 其余参数容忍, debug 记录)
 const cli = parseCliArgs(process.argv.slice(2));
 if (cli.help) {
@@ -106,7 +113,12 @@ const finalConfig = {
     // 超时/心跳: 未配置时由 proxy 内置默认值兜底(300000 / 60000 / 15000)
     REQUEST_TIMEOUT_MS: parseOptionalPositiveNumber(process.env.REQUEST_TIMEOUT_MS ?? fileConfig.REQUEST_TIMEOUT_MS),
     EVENT_IDLE_TIMEOUT_MS: parseOptionalPositiveNumber(process.env.OPENCODE_EVENT_IDLE_TIMEOUT_MS ?? fileConfig.EVENT_IDLE_TIMEOUT_MS),
-    SSE_HEARTBEAT_MS: parseOptionalPositiveNumber(process.env.OPENCODE_SSE_HEARTBEAT_MS ?? fileConfig.SSE_HEARTBEAT_MS)
+    SSE_HEARTBEAT_MS: parseOptionalPositiveNumber(process.env.OPENCODE_SSE_HEARTBEAT_MS ?? fileConfig.SSE_HEARTBEAT_MS),
+    // 上游限流快速失败阈值(0=关闭阈值判断) / 排队上限(0=不限制) / 进度日志间隔 / 卡住阈值(0=关闭)
+    FAST_FAIL_RETRY_MS: parseOptionalNonNegativeNumber(process.env.FAST_FAIL_RETRY_MS ?? fileConfig.FAST_FAIL_RETRY_MS),
+    QUEUE_MAX_WAIT_MS: parseOptionalNonNegativeNumber(process.env.QUEUE_MAX_WAIT_MS ?? fileConfig.QUEUE_MAX_WAIT_MS),
+    PROGRESS_LOG_INTERVAL_MS: parseOptionalNonNegativeNumber(process.env.PROGRESS_LOG_INTERVAL_MS ?? fileConfig.PROGRESS_LOG_INTERVAL_MS),
+    STALL_WARN_MS: parseOptionalNonNegativeNumber(process.env.STALL_WARN_MS ?? fileConfig.STALL_WARN_MS)
 };
 
 // Validate required configuration
@@ -144,6 +156,10 @@ logger.info(`  - Tail OpenCode Log: ${finalConfig.OPENCODE_LOG_TAIL ? `Yes (${fi
 logger.info(`  - Print OpenCode Logs (--print-logs): ${finalConfig.OPENCODE_PRINT_LOGS ? 'Yes' : 'No'}`);
 logger.info(`  - System Prompt Patterns: ${finalConfig.SYSTEM_PROMPT_PATTERNS ? `configured (${String(finalConfig.SYSTEM_PROMPT_PATTERNS).slice(0, 200)})` : 'default (built-in dsh markers)'}`);
 if (finalConfig.REQUEST_TIMEOUT_MS) logger.info(`  - Request Timeout: ${finalConfig.REQUEST_TIMEOUT_MS}ms`);
+logger.info(`  - Fast Fail Retry: ${finalConfig.FAST_FAIL_RETRY_MS === undefined ? 'default (60000ms)' : `${finalConfig.FAST_FAIL_RETRY_MS}ms${finalConfig.FAST_FAIL_RETRY_MS === 0 ? ' (disabled)' : ''}`}`);
+logger.info(`  - Queue Max Wait: ${finalConfig.QUEUE_MAX_WAIT_MS === undefined ? 'default (60000ms)' : (finalConfig.QUEUE_MAX_WAIT_MS === 0 ? 'unlimited' : `${finalConfig.QUEUE_MAX_WAIT_MS}ms`)}`);
+logger.info(`  - Progress Log Interval: ${finalConfig.PROGRESS_LOG_INTERVAL_MS === undefined ? 'default (300000ms)' : (finalConfig.PROGRESS_LOG_INTERVAL_MS === 0 ? 'disabled' : `${finalConfig.PROGRESS_LOG_INTERVAL_MS}ms`)}`);
+logger.info(`  - Stall Warn: ${finalConfig.STALL_WARN_MS === undefined ? 'default (300000ms)' : (finalConfig.STALL_WARN_MS === 0 ? 'disabled' : `${finalConfig.STALL_WARN_MS}ms`)}`);
 if (levelSettings.warnings.length) {
     logger.warn(`[Config] Log level warnings: ${levelSettings.warnings.join(' | ')}`);
 }

@@ -95,6 +95,10 @@ curl -X POST http://127.0.0.1:8083/v1/chat/completions \
 | `REQUEST_TIMEOUT_MS` | `300000` | 单次请求总超时(毫秒),超时返回 504,日志带"卡在哪一阶段" |
 | `OPENCODE_EVENT_IDLE_TIMEOUT_MS` | `60000` | 事件流空闲超时(毫秒),文本增量/工具活动都会重置;超时后回退轮询兜底 |
 | `OPENCODE_SSE_HEARTBEAT_MS` | `15000` | 流式期间 SSE 注释心跳间隔(`: ping`),避免长任务被客户端/中间层当空闲断开 |
+| `FAST_FAIL_RETRY_MS` | `60000` | 上游 `session.status=retry` 的等待上限(毫秒)。`nextInMs` 超过它**或** message 命中额度类文案(`free usage`/`usage exceeded`/`quota`/`subscribe`/`rate limit` 等)时立即结束请求:非流式返回 HTTP 429(`type=gateway_upstream_retry`),流式先发一条 SSE error 事件再结束;同时尽力调用 `session.abort` 取消上游。`0` = 关闭阈值判断(额度类文案仍然快速失败) |
+| `QUEUE_MAX_WAIT_MS` | `60000` | 单并发队列的排队上限(毫秒)。排队超过上限直接返回 HTTP 503(`type=gateway_queue_timeout`),避免上游卡住时后续请求无限排队(线上曾排了 298 秒);`0` = 不限制(旧行为) |
+| `PROGRESS_LOG_INTERVAL_MS` | `300000` | 每个在途请求每满一个间隔输出一条 INFO 进度日志(`reqId`/`phase`/`elapsedMs`/`idleMs`/`sessionId`/`model`/`stream`/`deltaChars`/`lastEvent`/`queueWaitMs`);`0` = 关闭 |
+| `STALL_WARN_MS` | `300000` | 看门狗把"这么久没有活动"的请求判定为卡住,每 30 秒扫描一次并打 WARN `[Proxy] Stalled request`(同一请求每个窗口最多一次);`0` = 关闭 |
 
 示例(开启鉴权):
 
@@ -110,7 +114,7 @@ docker run -d --restart=always --network common-all --name opencode-to-openai --
 - **特例:`LOG_LEVEL` 不写入 config.json**,由 node 进程直读环境变量,`docker run -e LOG_LEVEL=...` 每次启动都生效(优先级 env > config.json 的 `LOG_LEVEL` 字段 > 默认 `info`)
 - 想用新的 `-e` 重新生成:删掉挂载的 config.json 文件(或去掉 `-v` 挂载)后重建容器即可
 - 程序运行时读取优先级为 **环境变量 > config.json > 程序内置默认**(`index.js` 逐键合并,`PORT`/`OPENCODE_DISABLE_TOOLS` 等都是 env 优先),所以想临时改某一项直接加 `-e` 覆盖即可,不必删 config.json
-- 新增键(`OPENCODE_AUTO_APPROVE`/`OPENCODE_WORKDIR`/`OPENCODE_STREAM_TOOLS`/`OPENCODE_LOG_TAIL`/`OPENCODE_LOG_FILE`/`OPENCODE_PRINT_LOGS`/`SYSTEM_PROMPT_PATTERNS`/`REQUEST_TIMEOUT_MS`/`OPENCODE_EVENT_IDLE_TIMEOUT_MS`/`OPENCODE_SSE_HEARTBEAT_MS`)同样是 **env > config.json > 内置默认**,`-e OPENCODE_AUTO_APPROVE=false` 对已存在 config.json 的容器也生效;`LOG_LEVEL` 见下节优先级
+- 新增键(`OPENCODE_AUTO_APPROVE`/`OPENCODE_WORKDIR`/`OPENCODE_STREAM_TOOLS`/`OPENCODE_LOG_TAIL`/`OPENCODE_LOG_FILE`/`OPENCODE_PRINT_LOGS`/`SYSTEM_PROMPT_PATTERNS`/`REQUEST_TIMEOUT_MS`/`OPENCODE_EVENT_IDLE_TIMEOUT_MS`/`OPENCODE_SSE_HEARTBEAT_MS`/`FAST_FAIL_RETRY_MS`/`QUEUE_MAX_WAIT_MS`/`PROGRESS_LOG_INTERVAL_MS`/`STALL_WARN_MS`)同样是 **env > config.json > 内置默认**,`-e OPENCODE_AUTO_APPROVE=false` 对已存在 config.json 的容器也生效;`LOG_LEVEL` 见下节优先级
 
 ### 日志等级与请求日志
 
@@ -204,7 +208,7 @@ docker run -d --restart=always --network common-all --name opencode-to-openai -p
   - 风险提示:自动批准等于允许模型在容器内执行 bash/改文件。需要收紧时设 `OPENCODE_AUTO_APPROVE=false`(此时权限请求会等到超时),或把 `OPENCODE_WORKDIR` 指到受控目录,并用容器边界隔离。
 - **工作目录**:`-e OPENCODE_WORKDIR=/code/www/my/github/demo`。`session.create` 与 `prompt` 都带 `query.directory`,后端进程 cwd 也切到该目录;不配置时仍是原来的 jail 空目录(向后兼容)。
 - **工具执行可见**:从 SSE 的 ToolPart 提取工具名/状态/输入摘要/结果或错误摘要,info 级输出 `[opencode] tool running/completed/failed`,**不写进模型正文**;想在 SSE 响应里也看到进度,设 `OPENCODE_STREAM_TOOLS=true`(输出 `: tool ...` 注释行,OpenAI 客户端会忽略注释,不影响解析)。
-- **超时/心跳/重试**:`REQUEST_TIMEOUT_MS` 控总超时;流式期间每 `OPENCODE_SSE_HEARTBEAT_MS` 发一次 `: ping` 注释心跳;事件流空闲超时 `OPENCODE_EVENT_IDLE_TIMEOUT_MS`(默认 60s,文本增量与工具活动都会重置);`session.status=retry` 输出 warn 并带 `retryAfter` 摘要;首包/空闲超时后回退轮询兜底。
+- **超时/心跳/重试**:`REQUEST_TIMEOUT_MS` 控总超时;流式期间每 `OPENCODE_SSE_HEARTBEAT_MS` 发一次 `: ping` 注释心跳;事件流空闲超时 `OPENCODE_EVENT_IDLE_TIMEOUT_MS`(默认 60s,文本增量与工具活动都会重置);`session.status=retry` 输出 warn 并带 `retryAfter` 摘要,其中"等太久"或"额度耗尽"的情况会快速失败(见下节);首包/空闲超时后回退轮询兜底。
 
 ### opencode 执行情况怎么看
 
@@ -230,6 +234,64 @@ docker run -d --restart=always --network common-all --name opencode-to-openai -p
 - 默认标记:`^# 角色注入`、`^<system-reminder>`、`^【会话自动搬移已开启】`、`^Current runtime context`、`^# 项目系统提示词`、`^Time sampled while preparing turn`;
 - 自定义:`-e SYSTEM_PROMPT_PATTERNS='^# 角色注入;^<custom-tag>'`(分号/换行分隔,也支持 JSON 数组;正则里含逗号时请用分号分隔);关闭:`none`/`off`/`false`/`0`/`[]`;
 - 未改变:SSE 差量化、轮询兜底、`DISABLE_TOOLS` 的 tool filter 逻辑都保持原样。
+
+### 限流快速失败、排队上限与执行中进度
+
+线上曾出现"发消息一直没反应"的情况:上游 opencode 对免费额度耗尽发 `session.status=retry`(`nextInMs` 约 14 小时、`message="Free usage exceeded, subscribe to Go"`),旧逻辑只打一条 warn 然后继续等 `REQUEST_TIMEOUT_MS`(300s);单并发队列又把后续请求一起堵住(实测排了 298 秒)。现在按下面方式处理:
+
+1. **限流/额度耗尽快速失败**(`FAST_FAIL_RETRY_MS`,默认 60000ms):
+   - `nextInMs` 超过阈值,**或** message 命中额度类文案(`free usage`/`usage exceeded`/`usage limit`/`quota`/`subscribe`/`rate limit`/`too many requests`/`insufficient`)时立即结束本次请求;
+   - 非流式:`HTTP 429` + `{"error":{"message":"上游限流，请 N 秒后重试（原始信息）","type":"gateway_upstream_retry","retry_after_ms":N}}`;
+   - 流式:先发一条 SSE error 事件(`data: {"error":{...,"type":"gateway_upstream_retry"}}`),再发 `data: [DONE]` 正常结束连接;
+   - 同时尽力调用 `client.session.abort({ path: { id } })`(SDK 1.1.53 支持)取消上游会话,避免它继续跑;
+   - 日志:`[opencode] session retry ...`(带 `nextInMs`/`fastFail`/`fastFailReason`)+ `[Proxy] Request fast-failed on upstream retry`(带 `reqId`/`nextInMs`/`message`/`elapsedMs`),能直接看出"为什么快速失败";
+   - `nextInMs` 小于阈值且不是额度问题时继续等待(保留原有重试行为);`FAST_FAIL_RETRY_MS=0` 只关闭"等太久"判断,额度类文案仍然快速失败。
+2. **排队上限**(`QUEUE_MAX_WAIT_MS`,默认 60000ms):排队超过上限直接返回 `HTTP 503` + `{"error":{"message":"网关排队超时，请稍后重试","type":"gateway_queue_timeout","waited_ms":N}}`,并打 WARN(带排队长度/在途数);`0` = 不限制。
+3. **执行中进度日志**(`PROGRESS_LOG_INTERVAL_MS`,默认 300000ms = 5 分钟):每个在途请求每满一个间隔输出一条 INFO `[Proxy] Request progress`,字段:`reqId`、`phase`、`elapsedMs`、`idleMs`(距最近一次活动)、`sessionId`、`model`、`stream`、`deltaChars`、`lastEvent`(最近事件类型)、`queueWaitMs`;定时器随请求结束清理。
+4. **卡住请求可查**(`STALL_WARN_MS`,默认 300000ms):内存里维护在途请求注册表(每次事件/增量/阶段切换都刷新 `lastActivityAt`),看门狗每 30 秒扫描,`idleMs > STALL_WARN_MS` 的请求打 WARN `[Proxy] Stalled request`(字段 `reqId`/`idleMs`/`phase`/`sessionId`/`model`/`stream`/`deltaChars`),同一请求每个窗口最多报一次。
+
+在线查询"当前有哪些请求在跑、哪些已经 5 分钟没反应"(鉴权与其它 `/v1` 接口一致,配置了 `API_KEY` 时带 `Authorization: Bearer <YOUR_API_KEY>`):
+
+```bash
+curl -H "Authorization: Bearer <YOUR_API_KEY>" http://127.0.0.1:8083/v1/gateway/inflight
+```
+
+返回示例:
+
+```json
+{
+  "now": 1700000000000,
+  "count": 2,
+  "stalled": 1,
+  "requests": [
+    {
+      "reqId": "gw-mwotaiwy6rbo",
+      "phase": "prompt",
+      "model": "opencode/deepseek-v4.1-flash-free",
+      "stream": true,
+      "sessionId": "ses_xxx",
+      "startedAt": 1699999700000,
+      "elapsedMs": 300000,
+      "idleMs": 298240,
+      "queueWaitMs": 0,
+      "deltaChars": 0,
+      "lastEvent": "session.status",
+      "stalled": false
+    }
+  ]
+}
+```
+
+请求完成/失败/超时/快速失败都会从注册表移除(`finally` 保证),不会残留。
+
+### 输出侧零回显(系统提示词不再返回)
+
+事件层已按 message 角色过滤(只让 role=assistant 的 text/reasoning part 进入响应)。现在再加一层输出侧兜底:assistant 内容里若出现系统注入标记,直接裁掉并打 WARN(带 `reqId`/命中的标记/裁剪字符数):
+
+- 标记来源:`SYSTEM_PROMPT_PATTERNS`(与系统提示词提升同一套正则)+ 额外标记(网关拼 parts 的角色前缀 `USER: ...`/`SYSTEM(名称): ...`、`<system-reminder>`、`# 角色注入`、`# 项目系统提示词`、`【会话自动搬移已开启】`、`Current runtime context` 等);
+- 流式:只对行首做缓冲判定(正常文本立即放行,不增加首包延迟),命中标记的增量/整段丢弃;`[opencode] system prompt echo removed from assistant content`(流式)与 `[Proxy] System prompt echo removed from output`(非流式/轮询)都是 WARN 级;
+- 非流式/轮询:整段裁剪——首个非空行就命中标记时整段丢弃,标记出现在正文中间时只删命中行;
+- 覆盖所有返回路径:SSE 增量、非流式 `parts` 汇总、轮询兜底、rescue 兜底(轮询结果同样过滤)。
 
 ### 4097 后端端口对外访问
 

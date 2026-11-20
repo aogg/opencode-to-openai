@@ -8,14 +8,20 @@
  *   原样回显成 assistant 首包
  * - 把 ToolPart 事件转成可读日志(info 级: 工具开始/完成/失败, 输入/结果摘要), 不污染模型正文
  * - permission.updated: 自动回复 once(OPENCODE_AUTO_APPROVE, 兜底+审计), 避免 permission ask 挂起
- * - session.status retry: 输出限流/重试信息(带 retry-after 摘要)
+ * - session.status retry: 输出限流/重试信息; nextInMs 过大或命中额度类文案时立即快速失败
+ *   (FAST_FAIL_RETRY_MS), 并通过 client.session.abort 尽力取消上游, 不再干等 300 秒
+ * - 输出侧兜底: assistant 文本里若出现系统注入标记(上游把 user/system 内容当 assistant part 回显),
+ *   按增量裁掉(只对行首做缓冲判定, 正常文本不增加延迟)
  * - 首个增量 / 空闲超时 / 工具活动重置 idle 计时
+ * - onActivity 回调: 每个事件/增量都上报活动, 供在途注册表(进度日志/看门狗)使用
  *
  * 备注: opencode 1.19.5 的 `opencode serve` 不支持 `--auto`(传了会打印 help 并 exit 1),
  * 自动批准由"配置层 permission=allow + 本文件的 permission.updated 自动回复"两层实现。
  */
 
 import { logger as defaultLogger } from './logger.js';
+import { buildEchoPatterns, createStreamEchoFilter } from './output-guard.js';
+import { decideFastFail, normalizeRetryStatus } from './retry-guard.js';
 
 /** 单行预览(压掉换行 + 截断) */
 export function previewText(value, maxLen = 120) {
@@ -76,6 +82,20 @@ export function summarizeRetryMessage(message) {
 }
 
 /**
+ * 从 assistant 消息的 parts 里汇总正文/推理(轮询兜底用)
+ * 只统计该条消息(调用方已确认 role=assistant)的 text/reasoning part;
+ * 输出侧仍会再过一遍 sanitizeAssistantText(见 src/proxy.js), 防止上游把 user/system 内容塞进 assistant part。
+ * @param {Array} parts
+ * @returns {{content: string, reasoning: string}}
+ */
+export function extractFromParts(parts) {
+    if (!Array.isArray(parts)) return { content: '', reasoning: '' };
+    const content = parts.filter((p) => p && p.type === 'text' && typeof p.text === 'string').map((p) => p.text).join('');
+    const reasoning = parts.filter((p) => p && p.type === 'reasoning' && typeof p.text === 'string').map((p) => p.text).join('');
+    return { content, reasoning };
+}
+
+/**
  * 订阅并收集一次 prompt 的事件
  *
  * @param {object} options
@@ -89,8 +109,12 @@ export function summarizeRetryMessage(message) {
  * @param {string|null} [options.directory] opencode 工作目录(query.directory)
  * @param {Function|null} [options.onDelta] 文本增量回调 (delta, isReasoning)
  * @param {Function|null} [options.onTool] 工具/步骤活动回调, 用于可选 SSE 进度输出
+ * @param {Function|null} [options.onActivity] 任意事件/增量回调({type, events, deltaChars}), 供在途注册表使用
+ * @param {number} [options.fastFailRetryMs] 上游 retry 的等待阈值(0=关闭阈值判断; 额度类文案总是快速失败)
+ * @param {object[]|string[]|null} [options.echoPatterns] 输出侧系统注入标记(默认内置)
  * @param {object} [options.logger] 日志器
- * @returns {{ready: Promise<boolean>, promise: Promise<object>, abort: Function, state: object}}
+ * @returns {{ready: Promise<boolean>, promise: Promise<object>, fastFailPromise: Promise<object>,
+ *            getFastFail: Function, abort: Function, state: object}}
  */
 export function collectSessionEvents(options) {
     const {
@@ -104,6 +128,9 @@ export function collectSessionEvents(options) {
         directory = null,
         onDelta = null,
         onTool = null,
+        onActivity = null,
+        fastFailRetryMs = 60000,
+        echoPatterns = null,
         logger = defaultLogger
     } = options;
 
@@ -119,8 +146,43 @@ export function collectSessionEvents(options) {
         toolCalls: new Map(),
         permissions: 0,
         autoApproved: 0,
-        assistantError: null
+        assistantError: null,
+        echoRemovedChars: 0
     };
+
+    /* 输出侧兜底标记: 与系统提示词提升共用同一套正则(另加角色前缀等额外标记) */
+    const echoSources = echoPatterns && Array.isArray(echoPatterns) && echoPatterns.length
+        ? echoPatterns
+        : buildEchoPatterns(null);
+    const contentEchoFilter = createStreamEchoFilter({
+        patterns: echoSources,
+        onHit: (hit) => logger.warn('[opencode] system prompt echo removed from assistant content', {
+            reqId,
+            sessionId,
+            channel: 'content',
+            marker: hit.marker,
+            phase: hit.phase,
+            removedChars: hit.removedChars
+        })
+    });
+    const reasoningEchoFilter = createStreamEchoFilter({
+        patterns: echoSources,
+        onHit: (hit) => logger.warn('[opencode] system prompt echo removed from assistant reasoning', {
+            reqId,
+            sessionId,
+            channel: 'reasoning',
+            marker: hit.marker,
+            phase: hit.phase,
+            removedChars: hit.removedChars
+        })
+    });
+
+    /* 快速失败信号: 收到上游明确限流/额度耗尽时 resolve, proxy 用它立即结束请求(不再等 300s) */
+    let fastFailInfo = null;
+    let resolveFastFail = null;
+    const fastFailPromise = new Promise((resolve) => {
+        resolveFastFail = resolve;
+    });
 
     /* messageID -> role(message.updated 或 session.messages 回填): text/reasoning part 只认 assistant */
     const messageRoles = new Map();
@@ -152,6 +214,8 @@ export function collectSessionEvents(options) {
         if (settled) return;
         settled = true;
         clearTimers();
+        /* 先冲刷增量过滤器缓冲: 短回复可能在"行首判定"完成前就结束, 不冲刷会丢字 */
+        flushEchoBuffers();
         try {
             controller.abort();
         } catch (e) {
@@ -164,6 +228,7 @@ export function collectSessionEvents(options) {
             ms: Date.now() - startedAt,
             events: state.events,
             deltaChars: state.deltaChars,
+            echoRemovedChars: state.echoRemovedChars,
             toolCalls: state.toolCalls.size,
             permissions: state.permissions,
             autoApproved: state.autoApproved,
@@ -175,6 +240,7 @@ export function collectSessionEvents(options) {
             reasoning: state.reasoning,
             receivedDelta: state.receivedDelta,
             deltaChars: state.deltaChars,
+            echoRemovedChars: state.echoRemovedChars,
             firstDeltaAt: state.firstDeltaAt,
             events: state.events,
             toolCalls: [...state.toolCalls.values()],
@@ -183,8 +249,90 @@ export function collectSessionEvents(options) {
             ms: Date.now() - startedAt,
             reason,
             error: null,
+            fastFail: fastFailInfo,
             ...extra
         });
+    }
+
+    /** 把增量过滤器里缓冲的文本冲出来(结束/异常结束都要调用) */
+    function flushEchoBuffers() {
+        const contentRest = contentEchoFilter.flush();
+        if (contentRest) applyDelta(contentRest, false);
+        const reasoningRest = reasoningEchoFilter.flush();
+        if (reasoningRest) applyDelta(reasoningRest, true);
+        const contentStats = contentEchoFilter.stats();
+        const reasoningStats = reasoningEchoFilter.stats();
+        state.echoRemovedChars = contentStats.removedChars + reasoningStats.removedChars;
+    }
+
+    /** 计入增量并回调(统一入口: 增量过滤器/冲刷都走这里) */
+    function applyDelta(delta, isReasoning) {
+        if (!delta) return;
+        if (isReasoning) {
+            state.reasoning += delta;
+        } else {
+            state.content += delta;
+        }
+        state.deltaChars += delta.length;
+        if (onDelta) {
+            try {
+                onDelta(delta, isReasoning);
+            } catch (e) {
+                // 回调异常不静默: 记录后继续, 不能因客户端写失败中断事件收集
+                logger.warn('[opencode] onDelta callback failed', { reqId, sessionId, error: e.message });
+            }
+        }
+    }
+
+    /**
+     * 快速失败: 上游明确要求长时间等待(额度耗尽/限流), 立即结束本次收集并尽力取消上游会话。
+     * @param {object} info 归一化后的快速失败信息
+     */
+    function triggerFastFail(info) {
+        if (fastFailInfo) return;
+        fastFailInfo = info;
+        /* 记录"为什么快速失败": reqId / nextInMs / message / elapsedMs / 原因, 便于线上排查 */
+        logger.warn('[opencode] fast fail on upstream retry', {
+            reqId,
+            sessionId,
+            nextInMs: info.nextInMs,
+            retryAfterMs: info.retryAfterMs,
+            message: info.message,
+            reason: info.reason,
+            keyword: info.keyword || null,
+            attempt: info.attempt,
+            elapsedMs: info.elapsedMs
+        });
+        resolveFastFail(info);
+        finish({ fastFail: info }, 'fast-fail-retry');
+        abortUpstreamSession();
+    }
+
+    /** 尽力让上游停止继续跑(opencode SDK 支持 session.abort; 不支持时只是日志说明) */
+    function abortUpstreamSession() {
+        const sessionAbort = client && client.session && client.session.abort;
+        if (typeof sessionAbort !== 'function') {
+            logger.warn('[opencode] SDK does not support session.abort, only stop waiting locally', { reqId, sessionId });
+            return;
+        }
+        try {
+            const params = { path: { id: sessionId } };
+            if (directory) params.query = { directory };
+            const result = sessionAbort.call(client.session, params);
+            if (result && typeof result.then === 'function') {
+                result.then((response) => {
+                    if (response && response.error) {
+                        logger.warn('[opencode] session abort returned error', { reqId, sessionId });
+                    } else {
+                        logger.info('[opencode] upstream session aborted (fast fail)', { reqId, sessionId });
+                    }
+                }).catch((e) => {
+                    logger.warn('[opencode] session abort failed', { reqId, sessionId, error: e.message });
+                });
+            }
+        } catch (e) {
+            logger.warn('[opencode] session abort failed', { reqId, sessionId, error: e.message });
+        }
     }
 
     function resetIdleTimer() {
@@ -327,14 +475,24 @@ export function collectSessionEvents(options) {
         handleTextPart(part, properties);
     }
 
+    /* 差量化用的"上游原文"累计: 必须与实际下发内容分开, 否则输出过滤后 startsWith 判定会失效并重复 */
+    let rawContent = '';
+    let rawReasoning = '';
+
     function handleTextPart(part, properties) {
-        /* opencode>=1.19 事件无 delta 字段, part.text 是该 part 当前全量文本, 按已累积内容差量化出增量 */
+        const isReasoning = part.type === 'reasoning';
+        /* opencode>=1.19 事件无 delta 字段, part.text 是该 part 当前全量文本, 按上游原文累计差量化出增量 */
         let delta = properties?.delta;
         if (!delta && typeof part.text === 'string') {
-            const accumulated = part.type === 'reasoning' ? state.reasoning : state.content;
-            delta = part.text.startsWith(accumulated) ? part.text.slice(accumulated.length) : part.text;
+            const rawAccumulated = isReasoning ? rawReasoning : rawContent;
+            delta = part.text.startsWith(rawAccumulated) ? part.text.slice(rawAccumulated.length) : part.text;
         }
         if (!delta) return;
+        if (isReasoning) {
+            rawReasoning += delta;
+        } else {
+            rawContent += delta;
+        }
 
         state.receivedDelta = true;
         if (firstDeltaTimer) {
@@ -353,14 +511,10 @@ export function collectSessionEvents(options) {
             });
         }
 
-        if (part.type === 'reasoning') {
-            state.reasoning += delta;
-            if (onDelta) onDelta(delta, true);
-        } else {
-            state.content += delta;
-            if (onDelta) onDelta(delta, false);
-        }
-        state.deltaChars += delta.length;
+        /* 输出侧兜底: 命中系统注入标记的增量裁掉(不从上游原文累计里扣, 差量化仍按原文走) */
+        const filter = isReasoning ? reasoningEchoFilter : contentEchoFilter;
+        const filtered = filter.filter(delta);
+        if (filtered) applyDelta(filtered, isReasoning);
     }
 
     function handleMessageUpdated(event) {
@@ -458,18 +612,48 @@ export function collectSessionEvents(options) {
         const status = properties.status || {};
         if (status.type === 'retry') {
             const retry = summarizeRetryMessage(status.message);
+            const normalized = normalizeRetryStatus(status);
+            const decision = decideFastFail({
+                nextInMs: normalized.nextInMs,
+                message: normalized.message,
+                fastFailRetryMs
+            });
             logger.warn('[opencode] session retry (upstream throttling/overload)', {
                 reqId,
                 sessionId,
-                attempt: status.attempt,
+                attempt: normalized.attempt,
                 rateLimited: retry.rateLimited,
                 retryAfter: retry.retryAfter,
-                nextInMs: typeof status.next === 'number' ? status.next - Date.now() : null,
-                message: retry.message
+                nextInMs: normalized.nextInMs,
+                message: retry.message,
+                fastFail: decision.shouldFail,
+                fastFailReason: decision.reason,
+                fastFailKeyword: decision.keyword
             });
+            if (decision.shouldFail) {
+                triggerFastFail({
+                    nextInMs: decision.nextInMs,
+                    retryAfterMs: decision.retryAfterMs,
+                    message: retry.message,
+                    reason: decision.reason,
+                    keyword: decision.keyword,
+                    attempt: normalized.attempt,
+                    elapsedMs: Date.now() - startedAt
+                });
+            }
             return;
         }
         logger.debug('[opencode] session status', { reqId, sessionId, status: status.type });
+    }
+
+    /** 上报活动(事件/增量), 供在途注册表计算 idleMs 与进度日志 */
+    function notifyActivity(type) {
+        if (!onActivity) return;
+        try {
+            onActivity({ type: type || 'unknown', events: state.events, deltaChars: state.deltaChars });
+        } catch (e) {
+            logger.warn('[opencode] onActivity callback failed', { reqId, sessionId, error: e.message });
+        }
     }
 
     async function consume(stream) {
@@ -477,6 +661,7 @@ export function collectSessionEvents(options) {
             if (settled) break;
             state.events += 1;
             const type = event?.type;
+            notifyActivity(type);
             if (type === 'message.part.updated') {
                 const part = event.properties?.part;
                 if (!part) continue;
@@ -556,6 +741,9 @@ export function collectSessionEvents(options) {
     return {
         ready,
         promise,
+        /* 快速失败信号: 触发后 resolve(info); 未触发时永远 pending(proxy 用它 race, 不占定时器) */
+        fastFailPromise,
+        getFastFail: () => fastFailInfo,
         state,
         abort: () => finish({ aborted: true }, 'aborted')
     };

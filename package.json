@@ -9,7 +9,9 @@
   },
   "scripts": {
     "start": "node index.js",
-    "test:it": "node test/it-test.mjs"
+    "test": "node test/it-test.mjs && node test/gateway-test.mjs",
+    "test:it": "node test/it-test.mjs",
+    "test:gateway": "node test/gateway-test.mjs"
   },
   "keywords": [
     "opencode",
