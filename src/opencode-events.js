@@ -3,6 +3,9 @@
  *
  * 职责:
  * - 订阅 opencode serve 的 SSE 事件流, 差量化 text/reasoning 增量(兼容 opencode>=1.19 无 delta 字段)
+ * - 只把 **assistant 消息** 的 text/reasoning part 计入增量: opencode 对 user message 的 part 也发
+ *   message.part.updated, 不过滤会把客户端的 "# 角色注入 / 系统提示词 / system-reminder"(role=user)
+ *   原样回显成 assistant 首包
  * - 把 ToolPart 事件转成可读日志(info 级: 工具开始/完成/失败, 输入/结果摘要), 不污染模型正文
  * - permission.updated: 自动回复 once(OPENCODE_AUTO_APPROVE, 兜底+审计), 避免 permission ask 挂起
  * - session.status retry: 输出限流/重试信息(带 retry-after 摘要)
@@ -119,6 +122,13 @@ export function collectSessionEvents(options) {
         assistantError: null
     };
 
+    /* messageID -> role(message.updated 或 session.messages 回填): text/reasoning part 只认 assistant */
+    const messageRoles = new Map();
+    /* 每个未知 messageID 只触发一次 session.messages 查询, 失败不重试(流式有兜底轮询) */
+    const roleLookups = new Set();
+    let roleLookupCount = 0;
+    let roleLookupFailed = 0;
+
     let settled = false;
     let resolvePromise = null;
     const promise = new Promise((resolve) => {
@@ -156,7 +166,9 @@ export function collectSessionEvents(options) {
             deltaChars: state.deltaChars,
             toolCalls: state.toolCalls.size,
             permissions: state.permissions,
-            autoApproved: state.autoApproved
+            autoApproved: state.autoApproved,
+            roleLookups: roleLookupCount,
+            roleLookupFailed
         });
         resolvePromise({
             content: state.content,
@@ -254,6 +266,67 @@ export function collectSessionEvents(options) {
         }
     }
 
+    /** 缓存 messageID -> role; 只接受本会话的消息(返回缓存后的 role) */
+    function cacheMessageRole(info) {
+        if (!info || !info.id || !info.role) return null;
+        if (info.sessionID && info.sessionID !== sessionId) return null;
+        messageRoles.set(info.id, info.role);
+        return info.role;
+    }
+
+    /**
+     * 取消息角色; 未知时查一次 session.messages 回填(每请求每个新 messageID 只查一次).
+     * 事件流本身有缓冲, 这里的 await 不会丢后续事件.
+     * @param {string|null} messageID
+     * @returns {Promise<string|null>} 'assistant' | 'user' | null(未知/查询失败)
+     */
+    async function resolveMessageRole(messageID) {
+        if (!messageID) return null;
+        if (messageRoles.has(messageID)) return messageRoles.get(messageID);
+        if (roleLookups.has(messageID)) return messageRoles.get(messageID) || null;
+        roleLookups.add(messageID);
+        roleLookupCount += 1;
+        try {
+            const messagesRes = await client.session.messages({ path: { id: sessionId } });
+            const messages = messagesRes?.data || messagesRes || [];
+            if (Array.isArray(messages)) {
+                messages.forEach((entry) => cacheMessageRole(entry?.info));
+            }
+        } catch (e) {
+            // 查询失败不静默: 记录后保守跳过该 part, 不把来源不明的文本当 assistant 增量回显
+            roleLookupFailed += 1;
+            logger.debug('[opencode] message role lookup failed, skip unknown part', {
+                reqId,
+                sessionId,
+                messageID,
+                error: e.message
+            });
+        }
+        return messageRoles.get(messageID) || null;
+    }
+
+    /**
+     * 只有 assistant 消息的 text/reasoning part 允许进入增量;
+     * user 消息(客户端注入的系统提示词/技能列表等)与未知来源一律跳过并记 debug.
+     */
+    async function handleRoleFilteredTextPart(part, properties) {
+        const messageID = part.messageID || properties?.messageID || null;
+        const role = await resolveMessageRole(messageID);
+        if (settled) return;
+        if (role !== 'assistant') {
+            logger.debug('[opencode] skip non-assistant text part (not a delta)', {
+                reqId,
+                sessionId,
+                messageID: messageID || null,
+                role: role || 'unknown',
+                type: part.type,
+                chars: typeof part.text === 'string' ? part.text.length : 0
+            });
+            return;
+        }
+        handleTextPart(part, properties);
+    }
+
     function handleTextPart(part, properties) {
         /* opencode>=1.19 事件无 delta 字段, part.text 是该 part 当前全量文本, 按已累积内容差量化出增量 */
         let delta = properties?.delta;
@@ -293,6 +366,18 @@ export function collectSessionEvents(options) {
     function handleMessageUpdated(event) {
         const info = event.properties?.info;
         if (!info || info.sessionID !== sessionId) return;
+        /* 先落角色缓存: part 事件先到/后到都能据此判断, 避免 user part 混进增量 */
+        cacheMessageRole(info);
+        const role = messageRoles.get(info.id) || null;
+        /* role 缺失时保持旧行为(assistant); 明确是 user 的消息不参与错误/结束判定 */
+        if (role && role !== 'assistant') {
+            logger.debug('[opencode] user message updated (ignored for streaming)', {
+                reqId,
+                sessionId,
+                messageID: info.id || null
+            });
+            return;
+        }
         if (info.error) {
             state.assistantError = info.error;
             logger.error('[opencode] assistant error event', {
@@ -414,7 +499,8 @@ export function collectSessionEvents(options) {
                     continue;
                 }
                 if (part.type !== 'text' && part.type !== 'reasoning') continue;
-                handleTextPart(part, event.properties);
+                await handleRoleFilteredTextPart(part, event.properties);
+                if (settled) break;
                 continue;
             }
             if (type === 'message.updated') {
