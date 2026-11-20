@@ -78,7 +78,7 @@ Or directly set your preferred model:
 
 > Safety: tool calls are disabled by default (`disableTools=true`) to prevent local command/file changes. Enable only if you explicitly need tool access.
 
-> Debug: set plugin config `debug` to `true`, or export `OPENCODE_PROXY_DEBUG=1` to see request/session debug logs.
+> Debug: set plugin config `debug` to `true`, export `OPENCODE_PROXY_DEBUG=1`, or simply set `LOG_LEVEL=debug` (or run `node index.js --log-level debug`). Debug logs include the final upstream payload summary, opencode tool/permission events and the full upstream response text.
 
 #### 4. Service Self-Test (Recommended)
 Before syncing models, verify the proxy is up:
@@ -125,6 +125,15 @@ cp config.json.example config.json
 ```
 
 Set your `PORT`, `API_KEY`, `BIND_HOST`, `DISABLE_TOOLS`, and `OPENCODE_PATH` in `config.json`. The proxy will auto-detect `opencode` in common locations (e.g., `~/.opencode/bin` and npm/pnpm globals), but for production you should set an absolute path.
+
+For real (multi-step, tool-using) projects also set:
+
+- `OPENCODE_WORKDIR`: the directory opencode should work in (defaults to an isolated empty jail dir);
+- `OPENCODE_AUTO_APPROVE` (default `true`): auto-approve opencode permission requests so tool tasks do not hang;
+- `SYSTEM_PROMPT_PATTERNS`: user messages that are really system prompts (dsh role injection, project system prompt, `<system-reminder>`, ...) are promoted to `body.system` instead of being mixed into user parts. Set `none` to disable;
+- `REQUEST_TIMEOUT_MS`, `OPENCODE_STREAM_TOOLS`, `OPENCODE_LOG_TAIL`, `OPENCODE_PRINT_LOGS` as needed.
+
+Log level: `node index.js --log-level debug` (CLI) > `LOG_LEVEL=debug` (env) > `config.json` `LOG_LEVEL` > legacy `DEBUG` flag > default `info`. See [docker/README.md](./docker/README.md#日志等级怎么设置cli--env-configjson) for the full matrix.
 
 ### 3. Start Running
 

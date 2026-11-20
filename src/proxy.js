@@ -9,6 +9,14 @@ import path from 'path';
 import os from 'os';
 import { fileURLToPath } from 'url';
 import { logger, maskHeaders } from './logger.js';
+import {
+    buildPromptMessages,
+    parseSystemPromptPatterns,
+    previewText,
+    summarizeUpstreamPayload
+} from './prompt-builder.js';
+import { collectSessionEvents } from './opencode-events.js';
+import { resolveOpencodeLogFile, startOpencodeLogTail } from './opencode-log-tail.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -23,7 +31,17 @@ const STARTING_WAIT_INTERVAL_MS = 1000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 300000;
 const DEFAULT_POLL_INTERVAL_MS = 500;
 const DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS = 4000;
-const DEFAULT_EVENT_IDLE_TIMEOUT_MS = 8000;
+/* 工具任务期间可能长时间没有文本增量, 空闲超时从 8s 放宽到 60s, 且工具活动会重置计时 */
+const DEFAULT_EVENT_IDLE_TIMEOUT_MS = 60000;
+/* 流式期间定期发 SSE 注释心跳(: ping), 避免客户端/中间层把长任务当空闲断开 */
+const DEFAULT_SSE_HEARTBEAT_MS = 15000;
+/*
+ * 自动批准权限需要注入 opencode 配置的 permission 规则。
+ * 注意: opencode 1.19.5 的 `opencode serve` 不支持 `--auto`(传了会打印 help 并 exit 1, 已实测),
+ * 因此自动批准走"配置层 permission=allow" + "事件层 permission.updated 自动回复 once" 两层。
+ */
+const AUTO_APPROVE_PERMISSION_KEYS = ['edit', 'bash', 'webfetch', 'external_directory', 'doom_loop', 'read', 'glob', 'list', 'grep', 'task', 'question'];
+const OPENCODE_CONFIG_CONTENT_ENV = 'OPENCODE_CONFIG_CONTENT';
 
 const OPENCODE_BASENAME = 'opencode';
 
@@ -281,7 +299,53 @@ function extractUpstreamError(error) {
             bodySummary = `[unserializable: ${e?.message || 'unknown error'}]`;
         }
     }
-    return { status, bodySummary };
+    return { status, bodySummary, retryAfter: extractRetryAfter(error, body) };
+}
+
+/**
+ * 尽力提取上游限流的重试提示: 优先响应头 retry-after, 其次错误体里的 retry-after 文本
+ */
+function extractRetryAfter(error, body) {
+    const headers = error?.response?.headers || error?.headers || null;
+    if (headers) {
+        const raw = headers['retry-after'] ?? headers['Retry-After'] ?? null;
+        if (raw !== null && raw !== undefined && raw !== '') return String(raw).slice(0, 120);
+    }
+    const text = typeof body === 'string' ? body : (() => {
+        try {
+            return body === null || body === undefined ? '' : JSON.stringify(body);
+        } catch (e) {
+            // 序列化失败不静默: 用错误信息代替, 避免直接抛
+            return `[unserializable: ${e.message}]`;
+        }
+    })();
+    const match = String(text).match(/retry[-_ ]?after"?\s*[:=]?\s*"?(\d+(?:\.\d+)?\s*(?:ms|s|seconds|秒)?)/i);
+    return match ? match[1].trim() : null;
+}
+
+/**
+ * SDK 默认 throwOnError=false: 上游 4xx/5xx 会以 { error, response } 形式返回而不是抛异常。
+ * 这里统一抛成 Error(带 status / responseBody), 让错误日志能带状态码与错误体摘要。
+ * @param {object} result SDK 调用结果
+ * @param {string} label 阶段描述
+ */
+function assertNoUpstreamError(result, label) {
+    if (!result || !result.error) return result;
+    let errorText;
+    if (typeof result.error === 'string') {
+        errorText = result.error;
+    } else {
+        try {
+            errorText = JSON.stringify(result.error).slice(0, 300);
+        } catch (e) {
+            // 序列化失败不静默: 用错误信息代替
+            errorText = `[unserializable error: ${e.message}]`;
+        }
+    }
+    const error = new Error(`${label} failed: ${errorText}`);
+    error.status = result.response?.status ?? null;
+    error.responseBody = result.error;
+    throw error;
 }
 
 /**
@@ -289,7 +353,18 @@ function extractUpstreamError(error) {
  */
 function createApp(config) {
     // DEBUG 不再直接控制输出(由 startProxy 统一映射为 debug 日志等级), 故不在此解构
-    const { API_KEY, OPENCODE_SERVER_URL, REQUEST_TIMEOUT_MS, DISABLE_TOOLS } = config;
+    const {
+        API_KEY,
+        OPENCODE_SERVER_URL,
+        REQUEST_TIMEOUT_MS,
+        DISABLE_TOOLS,
+        OPENCODE_WORKDIR,
+        OPENCODE_AUTO_APPROVE,
+        OPENCODE_STREAM_TOOLS,
+        SYSTEM_PROMPT_PATTERNS,
+        EVENT_IDLE_TIMEOUT_MS,
+        SSE_HEARTBEAT_MS
+    } = config;
 
     const app = express();
 
@@ -322,6 +397,17 @@ function createApp(config) {
     app.use(bodyParser.json({ limit: '50mb' }));
 
     const client = createOpencodeClient({ baseUrl: OPENCODE_SERVER_URL });
+
+    /* 系统提示词提升规则: 命中规则的 user 消息内容提升到 prompt body.system, 不再拼进 parts */
+    const promptPatterns = parseSystemPromptPatterns(SYSTEM_PROMPT_PATTERNS);
+    if (promptPatterns.invalid.length) {
+        logger.warn('[Proxy] Invalid SYSTEM_PROMPT_PATTERNS entries were ignored', { invalid: promptPatterns.invalid });
+    }
+    logger.info('[Proxy] System prompt patterns loaded', {
+        mode: promptPatterns.disabled ? 'disabled' : (promptPatterns.configured ? 'custom' : 'default'),
+        count: promptPatterns.patterns.length,
+        patterns: promptPatterns.sources
+    });
 
     // Auth middleware
     app.use((req, res, next) => {
@@ -446,16 +532,15 @@ function createApp(config) {
     };
 
     async function promptWithTimeout(promptParams, timeoutMs) {
+        let timeoutId = null;
         const timeoutPromise = new Promise((_, reject) => {
-            setTimeout(() => reject(new Error(`Request timeout after ${timeoutMs}ms`)), timeoutMs);
+            timeoutId = setTimeout(() => reject(new Error(`Request timeout after ${timeoutMs}ms`)), timeoutMs);
         });
-        return Promise.race([client.session.prompt(promptParams), timeoutPromise]);
-    }
-
-    class NoEventDataError extends Error {
-        constructor(message) {
-            super(message);
-            this.name = 'NoEventDataError';
+        try {
+            return await Promise.race([client.session.prompt(promptParams), timeoutPromise]);
+        } finally {
+            /* 正常完成时清掉定时器, 避免每个请求残留一个 300s 定时器 */
+            if (timeoutId) clearTimeout(timeoutId);
         }
     }
 
@@ -502,137 +587,24 @@ function createApp(config) {
         throw new Error(`Request timeout after ${timeoutMs}ms`);
     }
 
-    async function collectFromEvents(sessionId, timeoutMs, onDelta, firstDeltaTimeoutMs, idleTimeoutMs) {
-        const controller = new AbortController();
-        const eventStreamResult = await client.event.subscribe({ signal: controller.signal });
-        const eventStream = eventStreamResult.stream;
-        let finished = false;
-        let content = '';
-        let reasoning = '';
-        let receivedDelta = false;
-        let deltaChars = 0;
-        let firstDeltaAt = null;
-        const startedAt = Date.now();
-
-        const finishPromise = new Promise((resolve, reject) => {
-            const timeoutId = setTimeout(() => {
-                if (finished) return;
-                finished = true;
-                controller.abort();
-                reject(new Error(`Request timeout after ${timeoutMs}ms`));
-            }, timeoutMs);
-
-            const firstDeltaTimer = firstDeltaTimeoutMs
-                ? setTimeout(() => {
-                    if (finished || receivedDelta) return;
-                    finished = true;
-                    controller.abort();
-                    logDebug('No event data received', { sessionId, ms: Date.now() - startedAt });
-                    resolve({ content: '', reasoning: '', noData: true });
-                }, firstDeltaTimeoutMs)
-                : null;
-
-            let idleTimer = null;
-            const scheduleIdleTimer = () => {
-                if (!idleTimeoutMs) return;
-                if (idleTimer) clearTimeout(idleTimer);
-                idleTimer = setTimeout(() => {
-                    if (finished) return;
-                    finished = true;
-                    controller.abort();
-                    logDebug('Event idle timeout', {
-                        sessionId,
-                        ms: Date.now() - startedAt,
-                        deltaChars
-                    });
-                    resolve({
-                        content,
-                        reasoning,
-                        idleTimeout: true,
-                        receivedDelta
-                    });
-                }, idleTimeoutMs);
-            };
-
-            (async () => {
-                try {
-                    for await (const event of eventStream) {
-                        if (event.type === 'message.part.updated' && ((event.properties.part && event.properties.part.sessionID) || event.properties.sessionID) === sessionId) {
-                            const { part } = event.properties;
-                            /* opencode>=1.19 事件无 delta 字段, part.text 是该 part 当前全量文本, 按已累积内容差量化出增量 */
-                            let delta = event.properties.delta;
-                            if (!delta && (part.type === 'text' || part.type === 'reasoning') && typeof part.text === 'string') {
-                                const acc = part.type === 'reasoning' ? reasoning : content;
-                                delta = part.text.startsWith(acc) ? part.text.slice(acc.length) : part.text;
-                            }
-                            if (delta) {
-                                receivedDelta = true;
-                                if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
-                                scheduleIdleTimer();
-                                if (!firstDeltaAt) {
-                                    firstDeltaAt = Date.now();
-                                    logDebug('SSE first delta', {
-                                        sessionId,
-                                        ms: firstDeltaAt - startedAt,
-                                        type: part.type
-                                    });
-                                }
-                                if (part.type === 'reasoning') {
-                                    reasoning += delta;
-                                    if (onDelta) onDelta(delta, true);
-                                } else {
-                                    content += delta;
-                                    if (onDelta) onDelta(delta, false);
-                                }
-                                deltaChars += delta.length;
-                            }
-                        }
-                        if (event.type === 'message.updated' &&
-                            event.properties.info.sessionID === sessionId &&
-                            event.properties.info.finish === 'stop') {
-                            if (!finished) {
-                                finished = true;
-                                clearTimeout(timeoutId);
-                                if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
-                                if (idleTimer) clearTimeout(idleTimer);
-                                logDebug('SSE completed', {
-                                    sessionId,
-                                    ms: Date.now() - startedAt,
-                                    deltaChars
-                                });
-                                resolve({ content, reasoning });
-                            }
-                            break;
-                        }
-                    }
-                } catch (e) {
-                    if (!finished) {
-                        finished = true;
-                        clearTimeout(timeoutId);
-                        if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
-                        if (idleTimer) clearTimeout(idleTimer);
-                        reject(e);
-                    }
-                }
-            })();
-        });
-
-        try {
-            return await finishPromise;
-        } finally {
-            controller.abort();
-        }
-    }
-
     // Chat completions endpoint
     app.post('/v1/chat/completions', async (req, res) => {
         try {
+            /* 入队时间: 单并发锁下, 复杂任务会把后续请求排住, 用于输出排队等待时长 */
+            const enqueuedAt = Date.now();
             await lock(async () => {
                 let sessionId = null;
-                let eventStream = null;
+                /* reqId/phase/requestStartedAt 必须声明在 try 之外: catch 里的错误日志要用到它们 */
+                let reqId = null;
+                let phase = 'init';
+                const requestStartedAt = Date.now();
 
                 try {
-                    const reqId = req.gatewayLog?.reqId || null;
+                    reqId = req.gatewayLog?.reqId || null;
+                    const queueWaitMs = Date.now() - enqueuedAt;
+                    if (queueWaitMs > 0) {
+                        logger.info('[Proxy] Queue wait', { reqId, waitedMs: queueWaitMs, queueLength: queue.length });
+                    }
                     logger.debug('Incoming OpenAI request', {
                         reqId,
                         method: req.method,
@@ -652,71 +624,74 @@ function createApp(config) {
                         req.gatewayLog.stream = Boolean(stream);
                     }
 
-                    const normalizeMessageContent = (content) => {
-                        if (typeof content === 'string') return content;
-                        if (Array.isArray(content)) {
-                            return content.map((part) => {
-                                if (typeof part === 'string') return part;
-                                if (part && typeof part.text === 'string') return part.text;
-                                return '';
-                            }).join('');
-                        }
-                        if (content && typeof content.text === 'string') return content.text;
-                        if (content === null || content === undefined) return '';
-                        if (typeof content === 'number' || typeof content === 'boolean') return String(content);
-                        return '';
-                    };
-
-                    const buildPromptParts = (rawMessages) => {
-                        const parts = [];
-                        const systemChunks = [];
-                        const userContents = [];
-                        rawMessages.forEach((m) => {
-                            const role = (m?.role || 'user').toLowerCase();
-                            const content = normalizeMessageContent(m?.content);
-                            if (role === 'system') {
-                                if (content) systemChunks.push(content);
-                                return;
-                            }
-                            if (!content) return;
-                            if (role === 'user') userContents.push(content);
-                            const roleLabel = role.toUpperCase();
-                            const nameSuffix = m?.name ? `(${m.name})` : '';
-                            parts.push({
-                                type: 'text',
-                                text: `${roleLabel}${nameSuffix}: ${content}`
-                            });
-                        });
-                        return {
-                            parts,
-                            system: systemChunks.join('\n\n'),
-                            lastUserMsg: userContents[userContents.length - 1] || ''
-                        };
-                    };
-
-                    const { parts, system: systemMsg, lastUserMsg } = buildPromptParts(messages);
+                    /* 系统提示词分离: role=system 进 body.system; 命中规则的 user 消息也提升到 body.system, 不拼进 parts */
+                    const built = buildPromptMessages(messages, promptPatterns.disabled ? [] : promptPatterns.patterns);
+                    const { parts, system: systemMsg, lastUserMsg, stats: promptStats } = built;
                     const systemWithGuard = applyToolGuard(systemMsg);
+                    const modelLabel = `${pID}/${mID}`;
+
+                    /* info 级默认输出"收到请求": 即使后面卡住, 也能看到请求确实进来了 */
+                    logger.info('[Proxy] Request received', {
+                        reqId,
+                        model: modelLabel,
+                        stream: Boolean(stream),
+                        messages: messages.length,
+                        lastUser: previewText(lastUserMsg, 120),
+                        hasSystem: Boolean(systemWithGuard),
+                        systemChars: systemWithGuard ? systemWithGuard.length : 0,
+                        promotedSystemMessages: promptStats.promotedCount,
+                        promotedChars: promptStats.promotedChars,
+                        parts: parts.length
+                    });
+
                     if (!parts.length) {
                         return res.status(400).json({ error: { message: 'messages must include at least one non-system text message' } });
                     }
                     logDebug('Request start', {
-                        model: `${pID}/${mID}`,
+                        model: modelLabel,
                         stream: Boolean(stream),
                         userMessages: messages.length,
                         system: Boolean(systemMsg),
                         lastUserLength: lastUserMsg.length,
                         parts: parts.length,
-                        disableTools: DISABLE_TOOLS
+                        disableTools: DISABLE_TOOLS,
+                        promptStats
+                    });
+                    if (promptStats.promotedCount > 0) {
+                        logger.debug('[Proxy] System prompt messages promoted out of user parts', {
+                            reqId,
+                            promotedCount: promptStats.promotedCount,
+                            promotedChars: promptStats.promotedChars,
+                            systemChars: systemWithGuard ? systemWithGuard.length : 0
+                        });
+                    }
+
+                    // Ensure backend is running(阶段日志: 后端就绪 + 耗时)
+                    phase = 'backend';
+                    const backendStartedAt = Date.now();
+                    const backend = await ensureBackend(config);
+                    const workdir = OPENCODE_WORKDIR || backend?.workdir || null;
+                    logger.info('[Proxy] Backend ready', {
+                        reqId,
+                        ms: Date.now() - backendStartedAt,
+                        spawned: Boolean(backend?.spawnedThisTime),
+                        workdir: workdir || null
                     });
 
-                    // Ensure backend is running
-                    await ensureBackend(config);
-
-                    // Create session
-                    const sessionRes = await client.session.create();
+                    // Create session(在 OPENCODE_WORKDIR 指定的目录里干活; 未配置时用 jail 空目录)
+                    phase = 'session';
+                    const sessionStartedAt = Date.now();
+                    const sessionParams = workdir ? { query: { directory: workdir } } : {};
+                    const sessionRes = await client.session.create(sessionParams);
+                    assertNoUpstreamError(sessionRes, 'Create OpenCode session');
                     sessionId = sessionRes.data?.id;
-                    if (!sessionId) throw new Error('Failed to create OpenCode session');
-                    logDebug('Session created', { sessionId });
+                    if (!sessionId) throw new Error('Failed to create OpenCode session (no session id in response)');
+                    logger.info('[Proxy] Session created', {
+                        reqId,
+                        sessionId,
+                        ms: Date.now() - sessionStartedAt,
+                        workdir: workdir || null
+                    });
 
                     const promptParams = {
                         path: { id: sessionId },
@@ -726,16 +701,17 @@ function createApp(config) {
                             parts: parts
                         }
                     };
+                    if (workdir) promptParams.query = { directory: workdir };
                     const toolOverrides = await getToolOverrides();
                     if (toolOverrides && Object.keys(toolOverrides).length > 0) {
                         promptParams.body.tools = toolOverrides;
                     }
-                    logger.debug('Upstream payload (final request body to opencode serve)', {
+                    logger.debug('Upstream payload (final request body to opencode serve)', summarizeUpstreamPayload(promptParams, {
                         reqId,
                         sessionId,
-                        model: `${pID}/${mID}`,
-                        payload: promptParams
-                    });
+                        model: modelLabel,
+                        disableTools: DISABLE_TOOLS
+                    }));
 
                     if (stream) {
                         res.setHeader('Content-Type', 'text/event-stream');
@@ -746,6 +722,23 @@ function createApp(config) {
                         let streamedContent = '';
                         let streamedReasoning = '';
                         let sseChunkCount = 0;
+
+                        let clientGone = false;
+                        res.on('close', () => { clientGone = true; });
+                        const writeSse = (text) => {
+                            if (clientGone || res.writableEnded) return false;
+                            res.write(text);
+                            return true;
+                        };
+
+                        /* 心跳: 长任务期间定期发 SSE 注释(: ping), 避免客户端/中间层把连接当空闲断开。
+                           响应结束/客户端断开/异常路径都会清理, 不依赖业务代码走到固定位置 */
+                        const heartbeatId = setInterval(() => {
+                            writeSse(': ping\n\n');
+                        }, SSE_HEARTBEAT_MS);
+                        if (typeof heartbeatId.unref === 'function') heartbeatId.unref();
+                        res.on('finish', () => clearInterval(heartbeatId));
+                        res.on('close', () => clearInterval(heartbeatId));
 
                         const sendDelta = (delta, isReasoning = false) => {
                             if (!delta) return;
@@ -768,32 +761,55 @@ function createApp(config) {
                             } else {
                                 chunk.choices[0].delta.content = filtered;
                             }
-                            res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-                            sseChunkCount++;
+                            if (writeSse(`data: ${JSON.stringify(chunk)}\n\n`)) sseChunkCount++;
                         };
 
+                        /* 可选: 把 opencode 工具进度作为 SSE 注释行输出(默认关闭; 注释行不影响客户端解析) */
+                        const onToolActivity = OPENCODE_STREAM_TOOLS
+                            ? (activity) => {
+                                const label = activity.tool ? `${activity.tool} ${activity.status}` : activity.status;
+                                const detail = activity.input || activity.output || activity.error || '';
+                                writeSse(`: tool ${label}${detail ? ` - ${detail}` : ''}\n\n`);
+                            }
+                            : null;
+
                         let collected = null;
+                        phase = 'prompt';
+                        const collector = collectSessionEvents({
+                            client,
+                            sessionId,
+                            reqId,
+                            timeoutMs: REQUEST_TIMEOUT_MS,
+                            firstDeltaTimeoutMs: DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
+                            idleTimeoutMs: EVENT_IDLE_TIMEOUT_MS,
+                            autoApprovePermission: OPENCODE_AUTO_APPROVE,
+                            directory: workdir,
+                            onDelta: sendDelta,
+                            onTool: onToolActivity
+                        });
                         try {
-                            const collectPromise = collectFromEvents(
-                                sessionId,
-                                REQUEST_TIMEOUT_MS,
-                                sendDelta,
-                                DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
-                                DEFAULT_EVENT_IDLE_TIMEOUT_MS
-                            );
-                            const safeCollect = collectPromise.catch((err) => ({ __error: err }));
+                            await collector.ready;
                             const promptStart = Date.now();
-                            await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
-                            logDebug('Prompt sent', { sessionId, ms: Date.now() - promptStart });
-                            collected = await safeCollect;
-                        } catch (e) {
-                            throw e;
+                            const promptResult = await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
+                            assertNoUpstreamError(promptResult, 'Send prompt');
+                            logger.info('[Proxy] Prompt sent', {
+                                reqId,
+                                sessionId,
+                                ms: Date.now() - promptStart,
+                                parts: parts.length,
+                                systemChars: systemWithGuard ? systemWithGuard.length : 0
+                            });
+                            phase = 'collect';
+                            collected = await collector.promise;
+                        } finally {
+                            collector.abort();
                         }
 
-                        if (collected && collected.__error) {
-                            logDebug('SSE collect error, falling back to polling', {
+                        if (!collected || collected.error || collected.timedOut) {
+                            logger.debug('SSE collect error, falling back to polling', {
                                 sessionId,
-                                error: collected.__error?.message
+                                error: collected?.error?.message || null,
+                                reason: collected?.reason || 'none'
                             });
                             const { content, reasoning, error } = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
                             if (error && !content && !reasoning) {
@@ -843,24 +859,61 @@ function createApp(config) {
                             if (safePolledContent) sendDelta(safePolledContent, false);
                         }
 
-                        res.write(`data: ${JSON.stringify({ id, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
-                        sseChunkCount++;
-                        res.write('data: [DONE]\n\n');
+                        if (writeSse(`data: ${JSON.stringify({ id, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`)) sseChunkCount++;
+                        writeSse('data: [DONE]\n\n');
                         res.end();
-                        logger.debug('SSE stream summary', {
+                        logger.info('[Proxy] Request completed', {
                             reqId,
                             sessionId,
                             model: `${pID}/${mID}`,
+                            stream: true,
                             chunks: sseChunkCount,
                             contentChars: streamedContent.length,
                             reasoningChars: streamedReasoning.length,
+                            totalMs: Date.now() - requestStartedAt,
+                            toolCalls: collected?.toolCalls?.length || 0,
+                            permissions: collected?.permissions || 0,
+                            autoApproved: collected?.autoApproved || 0,
                             finishReason: 'stop'
                         });
+                        logger.debug('[Proxy] Upstream response (stream full text)', {
+                            reqId,
+                            sessionId,
+                            content: streamedContent,
+                            reasoning: streamedReasoning
+                        });
                     } else {
-                        const promptStart = Date.now();
-                        await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
-                        logDebug('Prompt sent', { sessionId, ms: Date.now() - promptStart });
-                        const { content, reasoning, error } = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                        /* 非流式也要订阅事件流: 自动批准 permission(否则工具任务会一直等到超时) + 输出工具活动日志 */
+                        phase = 'prompt';
+                        const collector = collectSessionEvents({
+                            client,
+                            sessionId,
+                            reqId,
+                            timeoutMs: REQUEST_TIMEOUT_MS,
+                            firstDeltaTimeoutMs: 0,
+                            idleTimeoutMs: 0,
+                            autoApprovePermission: OPENCODE_AUTO_APPROVE,
+                            directory: workdir
+                        });
+                        let pollResult = null;
+                        try {
+                            await collector.ready;
+                            const promptStart = Date.now();
+                            const promptResult = await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
+                            assertNoUpstreamError(promptResult, 'Send prompt');
+                            logger.info('[Proxy] Prompt sent', {
+                                reqId,
+                                sessionId,
+                                ms: Date.now() - promptStart,
+                                parts: parts.length,
+                                systemChars: systemWithGuard ? systemWithGuard.length : 0
+                            });
+                            phase = 'poll';
+                            pollResult = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                        } finally {
+                            collector.abort();
+                        }
+                        const { content, reasoning, error } = pollResult;
                         if (error && !content && !reasoning) {
                             return res.status(502).json({
                                 error: {
@@ -884,6 +937,19 @@ function createApp(config) {
                             }],
                             usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
                         };
+                        logger.info('[Proxy] Request completed', {
+                            reqId,
+                            sessionId,
+                            model: `${pID}/${mID}`,
+                            stream: false,
+                            contentChars: safeContent.length,
+                            reasoningChars: safeReasoning.length,
+                            totalMs: Date.now() - requestStartedAt,
+                            toolCalls: collector.state.toolCalls.size,
+                            permissions: collector.state.permissions,
+                            autoApproved: collector.state.autoApproved,
+                            finishReason: 'stop'
+                        });
                         logger.debug('Upstream response (non-stream full JSON)', {
                             reqId,
                             sessionId,
@@ -892,16 +958,29 @@ function createApp(config) {
                         res.json(responsePayload);
                     }
                 } catch (error) {
-                    // 上游(opencode serve)调用链失败: error 级必输出, 含状态码与错误体摘要; 完整错误对象放 debug 级
+                    // 上游(opencode serve)调用链失败: error 级必输出, 含停在哪一阶段/状态码/错误体摘要; 完整错误对象放 debug 级
                     const upstream = extractUpstreamError(error);
+                    const isTimeout = Boolean(error.message && error.message.includes('Request timeout'));
+                    if (isTimeout) {
+                        logger.warn('[Proxy] Request timed out (stuck phase)', {
+                            reqId,
+                            sessionId,
+                            phase,
+                            elapsedMs: Date.now() - requestStartedAt,
+                            timeoutMs: REQUEST_TIMEOUT_MS
+                        });
+                    }
                     logger.error('[Proxy] API Error (upstream call failed)', {
                         reqId,
                         sessionId,
+                        phase,
+                        elapsedMs: Date.now() - requestStartedAt,
                         message: error.message,
                         status: upstream.status,
+                        retryAfter: upstream.retryAfter,
                         bodySummary: upstream.bodySummary
                     });
-                    logger.debug('[Proxy] Error details', { reqId, sessionId, error });
+                    logger.debug('[Proxy] Error details', { reqId, sessionId, phase, error });
 
                     if (!res.headersSent) {
                         let errorMessage = error.message;
@@ -918,6 +997,9 @@ function createApp(config) {
                                 type: error.constructor.name
                             }
                         });
+                    } else if (!res.writableEnded) {
+                        /* 流式已开始(响应头已发)后出错: 主动结束 SSE, 避免客户端一直挂着等数据 */
+                        res.end();
                     }
                     if (sessionId) {
                         try {
@@ -925,10 +1007,6 @@ function createApp(config) {
                         } catch (e) {
                             logger.warn('[Proxy] Failed to cleanup session on error:', { sessionId, error: e.message });
                         }
-                    }
-                } finally {
-                    if (eventStream && eventStream.close) {
-                        eventStream.close();
                     }
                 }
             }, REQUEST_TIMEOUT_MS + 20000);
@@ -953,17 +1031,61 @@ function createApp(config) {
 const backendState = new Map();
 
 /**
+ * 把自动批准规则合并进 opencode 的 OPENCODE_CONFIG_CONTENT(内联配置)。
+ * opencode 1.19.5 的 `serve` 没有 `--auto`(传了会 exit 1), 自动批准只能走配置层 permission=allow。
+ * @param {string|undefined} existingRaw 现有的 OPENCODE_CONFIG_CONTENT
+ * @returns {string} 合并后的 JSON 字符串
+ */
+function buildAutoApproveConfigContent(existingRaw) {
+    let baseConfig = {};
+    if (existingRaw && String(existingRaw).trim()) {
+        try {
+            const parsed = JSON.parse(existingRaw);
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                baseConfig = parsed;
+            } else {
+                logger.warn('[Proxy] Existing OPENCODE_CONFIG_CONTENT is not a JSON object, replaced by auto-approve config');
+            }
+        } catch (e) {
+            // 非法 JSON 不静默丢弃: 告警后以自动批准配置为准
+            logger.warn('[Proxy] Existing OPENCODE_CONFIG_CONTENT is invalid JSON, replaced by auto-approve config', { error: e.message });
+        }
+    }
+    const basePermission = baseConfig.permission && typeof baseConfig.permission === 'object' && !Array.isArray(baseConfig.permission)
+        ? baseConfig.permission
+        : {};
+    const permission = { ...basePermission };
+    AUTO_APPROVE_PERMISSION_KEYS.forEach((key) => {
+        if (permission[key] === undefined) permission[key] = 'allow';
+    });
+    if (permission['*'] === undefined) permission['*'] = 'allow';
+    return JSON.stringify({ ...baseConfig, permission });
+}
+
+/**
  * Backend Lifecycle Management
+ * @returns {Promise<object>} 后端状态(含 workdir / spawnedThisTime), 供请求阶段日志与 session/prompt 使用
  */
 async function ensureBackend(config) {
-    const { OPENCODE_SERVER_URL, OPENCODE_PATH, OPENCODE_BIND_HOST, USE_ISOLATED_HOME } = config;
+    const {
+        OPENCODE_SERVER_URL,
+        OPENCODE_PATH,
+        OPENCODE_BIND_HOST,
+        USE_ISOLATED_HOME,
+        OPENCODE_WORKDIR,
+        OPENCODE_AUTO_APPROVE,
+        OPENCODE_PRINT_LOGS
+    } = config;
     const stateKey = OPENCODE_SERVER_URL;
 
     if (!backendState.has(stateKey)) {
         backendState.set(stateKey, {
             isStarting: false,
             process: null,
-            jailRoot: null
+            jailRoot: null,
+            workdir: null,
+            spawnedAt: null,
+            spawnedThisTime: false
         });
     }
 
@@ -975,7 +1097,7 @@ async function ensureBackend(config) {
             await new Promise(r => setTimeout(r, STARTING_WAIT_INTERVAL_MS));
             try {
                 await checkHealth(OPENCODE_SERVER_URL);
-                return;
+                return state;
             } catch (e) { }
         }
         throw new Error('Backend startup timeout');
@@ -985,134 +1107,183 @@ async function ensureBackend(config) {
         await checkHealth(OPENCODE_SERVER_URL);
     } catch (err) {
         state.isStarting = true;
-        logger.info(`[Proxy] OpenCode backend not found at ${OPENCODE_SERVER_URL}. Starting...`);
+        try {
+            state.spawnedThisTime = false;
+            const backendStartedAt = Date.now();
+            logger.info(`[Proxy] OpenCode backend not found at ${OPENCODE_SERVER_URL}. Starting...`);
 
-        // Kill existing process if any
-        if (state.process) {
-            try {
-                state.process.kill();
-            } catch (e) { }
-        }
+            // Kill existing process if any
+            if (state.process) {
+                try {
+                    state.process.kill();
+                } catch (e) { }
+            }
 
-        // Cleanup old temp dir
-        if (state.jailRoot && fs.existsSync(state.jailRoot)) {
-            try {
-                fs.rmSync(state.jailRoot, { recursive: true, force: true });
-            } catch (e) { }
-        }
+            // Cleanup old temp dir
+            if (state.jailRoot && fs.existsSync(state.jailRoot)) {
+                try {
+                    fs.rmSync(state.jailRoot, { recursive: true, force: true });
+                } catch (e) { }
+            }
 
-        const isWindows = process.platform === 'win32';
-        const useIsolatedHome = typeof USE_ISOLATED_HOME === 'boolean'
-            ? USE_ISOLATED_HOME
-            : String(process.env.OPENCODE_USE_ISOLATED_HOME || '').toLowerCase() === 'true' ||
-            process.env.OPENCODE_USE_ISOLATED_HOME === '1';
+            const isWindows = process.platform === 'win32';
+            const useIsolatedHome = typeof USE_ISOLATED_HOME === 'boolean'
+                ? USE_ISOLATED_HOME
+                : String(process.env.OPENCODE_USE_ISOLATED_HOME || '').toLowerCase() === 'true' ||
+                process.env.OPENCODE_USE_ISOLATED_HOME === '1';
 
-        // On Windows, don't use isolated fake-home to avoid path issues
-        // On Unix-like systems, use jail for isolation
-        const salt = Math.random().toString(36).substring(7);
-        const jailRoot = path.join(os.tmpdir(), 'opencode-proxy-jail', salt);
-        state.jailRoot = jailRoot;
-        const workspace = path.join(jailRoot, 'empty-workspace');
+            // On Windows, don't use isolated fake-home to avoid path issues
+            // On Unix-like systems, use jail for isolation
+            const salt = Math.random().toString(36).substring(7);
+            const jailRoot = path.join(os.tmpdir(), 'opencode-proxy-jail', salt);
+            state.jailRoot = jailRoot;
+            const workspace = path.join(jailRoot, 'empty-workspace');
 
-        let envVars;
-        let cwd;
+            /* 工作目录: OPENCODE_WORKDIR 优先(真实项目目录, 复杂任务必需), 未配置/不存在时回退 jail 空目录 */
+            let workdir = null;
+            if (OPENCODE_WORKDIR) {
+                const resolvedWorkdir = path.isAbsolute(OPENCODE_WORKDIR)
+                    ? OPENCODE_WORKDIR
+                    : path.resolve(process.cwd(), OPENCODE_WORKDIR);
+                if (fs.existsSync(resolvedWorkdir)) {
+                    workdir = resolvedWorkdir;
+                } else {
+                    logger.warn('[Proxy] OPENCODE_WORKDIR does not exist, fallback to jail workspace', { workdir: resolvedWorkdir });
+                }
+            }
+            const spawnCwd = workdir || workspace;
+            state.workdir = spawnCwd;
 
-        if (isWindows) {
-            // Windows: use normal user home to avoid opencode storage path issues
-            fs.mkdirSync(workspace, { recursive: true });
-            cwd = workspace;
-            envVars = {
-                ...process.env,
-                OPENCODE_PROJECT_DIR: workspace
-            };
-            logger.info('[Proxy] Running on Windows, using standard user home directory');
-        } else {
-            fs.mkdirSync(workspace, { recursive: true });
-            cwd = workspace;
+            let envVars;
+            const cwd = spawnCwd;
 
-            if (useIsolatedHome) {
-                // Unix-like: use isolated fake-home
-                const fakeHome = path.join(jailRoot, 'fake-home');
-
-                // Create necessary opencode directories
-                const opencodeDir = path.join(fakeHome, '.local', 'share', 'opencode');
-                const storageDir = path.join(opencodeDir, 'storage');
-                const messageDir = path.join(storageDir, 'message');
-                const sessionDir = path.join(storageDir, 'session');
-
-                [fakeHome, opencodeDir, storageDir, messageDir, sessionDir].forEach(d => {
-                    if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
-                });
-
+            if (isWindows) {
+                // Windows: use normal user home to avoid opencode storage path issues
+                fs.mkdirSync(workspace, { recursive: true });
                 envVars = {
                     ...process.env,
-                    HOME: fakeHome,
-                    USERPROFILE: fakeHome,
-                    OPENCODE_PROJECT_DIR: workspace
+                    OPENCODE_PROJECT_DIR: spawnCwd
                 };
-                logger.info('[Proxy] Using isolated home for OpenCode');
+                logger.info('[Proxy] Running on Windows, using standard user home directory');
             } else {
-                envVars = {
-                    ...process.env,
-                    OPENCODE_PROJECT_DIR: workspace
-                };
-                logger.info('[Proxy] Using real HOME for OpenCode (isolation disabled)');
+                fs.mkdirSync(workspace, { recursive: true });
+
+                if (useIsolatedHome) {
+                    // Unix-like: use isolated fake-home
+                    const fakeHome = path.join(jailRoot, 'fake-home');
+
+                    // Create necessary opencode directories
+                    const opencodeDir = path.join(fakeHome, '.local', 'share', 'opencode');
+                    const storageDir = path.join(opencodeDir, 'storage');
+                    const messageDir = path.join(storageDir, 'message');
+                    const sessionDir = path.join(storageDir, 'session');
+
+                    [fakeHome, opencodeDir, storageDir, messageDir, sessionDir].forEach(d => {
+                        if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
+                    });
+
+                    envVars = {
+                        ...process.env,
+                        HOME: fakeHome,
+                        USERPROFILE: fakeHome,
+                        OPENCODE_PROJECT_DIR: spawnCwd
+                    };
+                    logger.info('[Proxy] Using isolated home for OpenCode');
+                } else {
+                    envVars = {
+                        ...process.env,
+                        OPENCODE_PROJECT_DIR: spawnCwd
+                    };
+                    logger.info('[Proxy] Using real HOME for OpenCode (isolation disabled)');
+                }
             }
-        }
 
-        const [, , portStr] = OPENCODE_SERVER_URL.split(':');
-        const port = portStr ? portStr.split('/')[0] : '4097';
-        const resolved = resolveOpencodePath(OPENCODE_PATH);
-        const opencodeBin = resolved.path || OPENCODE_PATH || OPENCODE_BASENAME;
-        if (resolved.path) {
-            logger.info(`[Proxy] Using OpenCode binary: ${opencodeBin} (source: ${resolved.source})`);
-        } else {
-            logger.warn(`[Proxy] Unable to resolve OpenCode binary for '${OPENCODE_PATH}'. Using as-is.`);
-        }
-
-        // Cross-platform spawn options
-        const useShell = process.platform === 'win32' || !resolved.path ||
-            opencodeBin.endsWith('.cmd') || opencodeBin.endsWith('.bat');
-        const spawnOptions = {
-            stdio: 'inherit',
-            cwd: cwd,
-            env: envVars,
-            shell: useShell  // Use shell only when needed (e.g., Windows .cmd or unresolved PATH)
-        };
-
-        // 后端监听地址: OPENCODE_BIND_HOST(默认 127.0.0.1; Docker 内设 0.0.0.0 以便对外暴露 4097)
-        const bindHost = OPENCODE_BIND_HOST || '127.0.0.1';
-        logger.info(`[Proxy] Starting OpenCode backend: --port ${port} --hostname ${bindHost}`);
-        state.process = spawn(opencodeBin, ['serve', '--port', port, '--hostname', bindHost], spawnOptions);
-
-        // Handle spawn errors
-        state.process.on('error', (err) => {
-            logger.error(`[Proxy] Failed to spawn OpenCode: ${err.message}`);
-            if (err.code === 'ENOENT') {
-                logger.error(`[Proxy] Command '${OPENCODE_PATH}' not found. Please ensure OpenCode is installed and in your PATH.`);
-                logger.error(`[Proxy] You can specify the full path in config.json using 'OPENCODE_PATH'`);
+            const [, , portStr] = OPENCODE_SERVER_URL.split(':');
+            const port = portStr ? portStr.split('/')[0] : '4097';
+            const resolved = resolveOpencodePath(OPENCODE_PATH);
+            const opencodeBin = resolved.path || OPENCODE_PATH || OPENCODE_BASENAME;
+            if (resolved.path) {
+                logger.info(`[Proxy] Using OpenCode binary: ${opencodeBin} (source: ${resolved.source})`);
+            } else {
+                logger.warn(`[Proxy] Unable to resolve OpenCode binary for '${OPENCODE_PATH}'. Using as-is.`);
             }
-        });
 
-        // Wait for backend to be ready
-        let started = false;
-        for (let i = 0; i < STARTUP_WAIT_ITERATIONS; i++) {
-            await new Promise(r => setTimeout(r, STARTUP_WAIT_INTERVAL_MS));
-            try {
-                await checkHealth(OPENCODE_SERVER_URL);
-                logger.info('[Proxy] OpenCode backend ready.');
-                started = true;
-                break;
-            } catch (e) { }
-        }
+            // Cross-platform spawn options
+            const useShell = process.platform === 'win32' || !resolved.path ||
+                opencodeBin.endsWith('.cmd') || opencodeBin.endsWith('.bat');
+            const spawnOptions = {
+                stdio: 'inherit',
+                cwd: cwd,
+                env: envVars,
+                shell: useShell  // Use shell only when needed (e.g., Windows .cmd or unresolved PATH)
+            };
 
-        state.isStarting = false;
+            // 后端监听地址: OPENCODE_BIND_HOST(默认 127.0.0.1; Docker 内设 0.0.0.0 以便对外暴露 4097)
+            const bindHost = OPENCODE_BIND_HOST || '127.0.0.1';
+            const spawnArgs = ['serve', '--port', port, '--hostname', bindHost];
+            /* 可选: 让 opencode 把自己的日志直接并到容器日志(stdio 已是 inherit) */
+            if (OPENCODE_PRINT_LOGS) {
+                spawnArgs.push('--print-logs', '--log-level', logger.level === 'debug' ? 'DEBUG' : 'INFO');
+            }
+            /* 自动批准权限: opencode 1.19.5 serve 无 --auto, 通过内联配置把 permission 规则设为 allow */
+            if (OPENCODE_AUTO_APPROVE) {
+                envVars[OPENCODE_CONFIG_CONTENT_ENV] = buildAutoApproveConfigContent(envVars[OPENCODE_CONFIG_CONTENT_ENV]);
+                logger.info('[Proxy] Auto-approve permissions enabled (config permission=allow + event auto-reply)', {
+                    permissionKeys: AUTO_APPROVE_PERMISSION_KEYS
+                });
+            } else {
+                logger.info('[Proxy] Auto-approve permissions disabled (OPENCODE_AUTO_APPROVE=false): permission asks wait for manual approval until timeout');
+            }
+            logger.info(`[Proxy] Starting OpenCode backend: ${spawnArgs.join(' ')}`, {
+                cwd,
+                printLogs: Boolean(OPENCODE_PRINT_LOGS),
+                autoApprove: Boolean(OPENCODE_AUTO_APPROVE),
+                workdir: workdir || null
+            });
+            state.process = spawn(opencodeBin, spawnArgs, spawnOptions);
+            state.spawnedThisTime = true;
+            state.spawnedAt = Date.now();
 
-        if (!started) {
-            logger.warn('[Proxy] Backend start timed out.');
-            throw new Error('Backend start timeout');
+            // Handle spawn errors
+            state.process.on('error', (err) => {
+                logger.error(`[Proxy] Failed to spawn OpenCode: ${err.message}`);
+                if (err.code === 'ENOENT') {
+                    logger.error(`[Proxy] Command '${OPENCODE_PATH}' not found. Please ensure OpenCode is installed and in your PATH.`);
+                    logger.error(`[Proxy] You can specify the full path in config.json using 'OPENCODE_PATH'`);
+                }
+            });
+
+            // Wait for backend to be ready
+            let started = false;
+            for (let i = 0; i < STARTUP_WAIT_ITERATIONS; i++) {
+                await new Promise(r => setTimeout(r, STARTUP_WAIT_INTERVAL_MS));
+                try {
+                    await checkHealth(OPENCODE_SERVER_URL);
+                    logger.info('[Proxy] OpenCode backend ready.', { ms: Date.now() - backendStartedAt });
+                    started = true;
+                    break;
+                } catch (e) { }
+            }
+
+            if (!started) {
+                logger.warn('[Proxy] Backend start timed out.');
+                throw new Error('Backend start timeout');
+            }
+        } finally {
+            state.isStarting = false;
         }
     }
+    return state;
+}
+
+/**
+ * SYSTEM_PROMPT_PATTERNS 选项归一: 显式传入(含 null=用默认)优先, 否则读环境变量, 空串视为未配置
+ */
+function resolvePatternsOption(value) {
+    if (value !== undefined) return value;
+    const envValue = process.env.SYSTEM_PROMPT_PATTERNS;
+    if (envValue !== undefined && String(envValue).trim() !== '') return envValue;
+    return null;
 }
 
 /**
@@ -1136,6 +1307,11 @@ export function startProxy(options) {
         normalizeBool(process.env.OPENCODE_DISABLE_TOOLS) ??
         false;
 
+    const positiveNumber = (value, fallback) => {
+        const parsed = Number(value);
+        return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+    };
+
     const config = {
         PORT: options.PORT || 8083,
         API_KEY: options.API_KEY || '',
@@ -1143,16 +1319,41 @@ export function startProxy(options) {
         OPENCODE_BIND_HOST: options.OPENCODE_BIND_HOST || options.openCodeBindHost || process.env.OPENCODE_BIND_HOST || '127.0.0.1',
         OPENCODE_PATH: options.OPENCODE_PATH || 'opencode',
         BIND_HOST: options.BIND_HOST || options.bindHost || process.env.OPENCODE_PROXY_BIND_HOST || '127.0.0.1',
-        // LOG_LEVEL 原始值: index.js 已按 "env > config.json" 合并传入; 直启/插件场景回退读环境变量
+        // LOG_LEVEL 原始值: index.js 已按 "CLI > env > config.json" 合并传入; 直启/插件场景回退读环境变量
         LOG_LEVEL: options.LOG_LEVEL ?? options.logLevel ?? process.env.LOG_LEVEL ?? null,
+        // 日志等级来源(仅用于启动日志展示): index.js 会传入 CLI/env/config.json/fallback
+        LOG_LEVEL_SOURCE: options.LOG_LEVEL_SOURCE || null,
         USE_ISOLATED_HOME: typeof options.USE_ISOLATED_HOME === 'boolean'
             ? options.USE_ISOLATED_HOME
             : String(options.USE_ISOLATED_HOME || '').toLowerCase() === 'true' ||
             options.USE_ISOLATED_HOME === '1' ||
             String(process.env.OPENCODE_USE_ISOLATED_HOME || '').toLowerCase() === 'true' ||
             process.env.OPENCODE_USE_ISOLATED_HOME === '1',
-        REQUEST_TIMEOUT_MS: Number(options.REQUEST_TIMEOUT_MS || process.env.OPENCODE_PROXY_REQUEST_TIMEOUT_MS || DEFAULT_REQUEST_TIMEOUT_MS),
+        REQUEST_TIMEOUT_MS: positiveNumber(options.REQUEST_TIMEOUT_MS ?? process.env.OPENCODE_PROXY_REQUEST_TIMEOUT_MS, DEFAULT_REQUEST_TIMEOUT_MS),
         DISABLE_TOOLS: disableTools,
+        /* 复杂任务支持: opencode 工作目录(默认 jail 空目录, 可配置成真实项目目录) */
+        OPENCODE_WORKDIR: options.OPENCODE_WORKDIR ?? process.env.OPENCODE_WORKDIR ?? '',
+        /* 自动批准权限(默认开): serve 不支持 --auto, 通过配置 permission=allow + 事件自动回复实现 */
+        OPENCODE_AUTO_APPROVE: normalizeBool(options.OPENCODE_AUTO_APPROVE) ??
+            normalizeBool(process.env.OPENCODE_AUTO_APPROVE) ??
+            true,
+        /* 可选: 把工具进度以 SSE 注释行输出(默认关) */
+        OPENCODE_STREAM_TOOLS: normalizeBool(options.OPENCODE_STREAM_TOOLS) ??
+            normalizeBool(process.env.OPENCODE_STREAM_TOOLS) ??
+            false,
+        /* 可选: tail opencode 日志文件, 新行以 debug 级转发(默认关) */
+        OPENCODE_LOG_TAIL: normalizeBool(options.OPENCODE_LOG_TAIL) ??
+            normalizeBool(process.env.OPENCODE_LOG_TAIL) ??
+            false,
+        OPENCODE_LOG_FILE: options.OPENCODE_LOG_FILE ?? process.env.OPENCODE_LOG_FILE ?? '',
+        /* 可选: 让 opencode serve 加 --print-logs, 把自己的日志并进容器日志(默认关) */
+        OPENCODE_PRINT_LOGS: normalizeBool(options.OPENCODE_PRINT_LOGS) ??
+            normalizeBool(process.env.OPENCODE_PRINT_LOGS) ??
+            false,
+        /* 系统提示词提升规则: 未配置/空 -> prompt-builder 内置默认标记; 显式 none/off/[] -> 关闭 */
+        SYSTEM_PROMPT_PATTERNS: resolvePatternsOption(options.SYSTEM_PROMPT_PATTERNS),
+        EVENT_IDLE_TIMEOUT_MS: positiveNumber(options.EVENT_IDLE_TIMEOUT_MS ?? process.env.OPENCODE_EVENT_IDLE_TIMEOUT_MS, DEFAULT_EVENT_IDLE_TIMEOUT_MS),
+        SSE_HEARTBEAT_MS: positiveNumber(options.SSE_HEARTBEAT_MS ?? process.env.OPENCODE_SSE_HEARTBEAT_MS, DEFAULT_SSE_HEARTBEAT_MS),
         DEBUG: String(options.DEBUG || '').toLowerCase() === 'true' ||
             options.DEBUG === '1' ||
             String(process.env.OPENCODE_PROXY_DEBUG || '').toLowerCase() === 'true' ||
@@ -1160,8 +1361,12 @@ export function startProxy(options) {
     };
 
     // 日志等级解析(启动即校准, 后续所有日志按此等级输出):
-    // 1) LOG_LEVEL(options/env, 不区分大小写) 2) 未显式设置且旧 DEBUG 开关开启时提为 debug(向后兼容)
-    // 3) 默认 info; 非法值回退 info 并 warn 告警
+    // 1) LOG_LEVEL(index.js 已按 CLI > env > config.json 解析; 直启/插件场景回退 env)
+    // 2) 未显式设置且旧 DEBUG 开关开启时提为 debug(向后兼容) 3) 默认 info; 非法值回退 info 并 warn 告警
+    const levelSourceHint = config.LOG_LEVEL_SOURCE
+        || (options.LOG_LEVEL !== undefined || options.logLevel !== undefined
+            ? 'env/config LOG_LEVEL'
+            : (process.env.LOG_LEVEL !== undefined ? 'env LOG_LEVEL' : null));
     let levelResolution = logger.setLevel(config.LOG_LEVEL);
     if (!levelResolution.valid) {
         logger.warn(`Invalid LOG_LEVEL '${levelResolution.requested}', fallback to 'info' (valid values: error/warn/info/debug)`);
@@ -1171,13 +1376,34 @@ export function startProxy(options) {
     config.LOG_LEVEL = logger.level;
     const levelSource = !levelResolution.explicit
         ? (config.DEBUG ? 'legacy DEBUG flag' : 'default')
-        : 'LOG_LEVEL';
+        : (levelSourceHint || 'LOG_LEVEL');
 
     const { app } = createApp(config);
+
+    /* 可选: tail opencode 日志文件(新行 debug 级转发), 作为"实时看到 opencode 在干什么"的第二路信息 */
+    let logTail = null;
+    if (config.OPENCODE_LOG_TAIL) {
+        const logFile = resolveOpencodeLogFile({ configuredPath: config.OPENCODE_LOG_FILE, logger });
+        if (logFile) {
+            logTail = startOpencodeLogTail({ filePath: logFile, logger });
+        } else {
+            logger.warn('[opencode][log] OPENCODE_LOG_TAIL=true but no opencode log file found, tail disabled');
+        }
+    }
 
     const server = app.listen(config.PORT, config.BIND_HOST, async () => {
         logger.info(`Log level: ${logger.level} (source: ${levelSource})`);
         logger.info(`[Proxy] Active at http://${config.BIND_HOST}:${config.PORT}`);
+        logger.info('[Proxy] Runtime options', {
+            workdir: config.OPENCODE_WORKDIR || '(jail empty workspace)',
+            autoApprovePermissions: config.OPENCODE_AUTO_APPROVE,
+            streamToolProgress: config.OPENCODE_STREAM_TOOLS,
+            printOpencodeLogs: config.OPENCODE_PRINT_LOGS,
+            tailOpencodeLog: Boolean(logTail),
+            requestTimeoutMs: config.REQUEST_TIMEOUT_MS,
+            eventIdleTimeoutMs: config.EVENT_IDLE_TIMEOUT_MS,
+            sseHeartbeatMs: config.SSE_HEARTBEAT_MS
+        });
         try {
             await ensureBackend(config);
         } catch (error) {
@@ -1187,7 +1413,17 @@ export function startProxy(options) {
 
     return {
         server,
+        stopLogTail: () => {
+            if (logTail) {
+                logTail.stop();
+                logTail = null;
+            }
+        },
         killBackend: () => {
+            if (logTail) {
+                logTail.stop();
+                logTail = null;
+            }
             const state = backendState.get(config.OPENCODE_SERVER_URL);
             if (state && state.process) {
                 state.process.kill();

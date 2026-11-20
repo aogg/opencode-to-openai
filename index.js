@@ -1,5 +1,6 @@
 import { startProxy } from './src/proxy.js';
 import { logger } from './src/logger.js';
+import { parseCliArgs, resolveLogLevelSettings, resolvePatternsSetting, usageText } from './src/cli.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -18,8 +19,26 @@ function parseBool(value, fallback) {
     return Boolean(value);
 }
 
+/** 正数解析: 空/非法时返回 undefined, 交给 proxy 内置默认值兜底 */
+function parseOptionalPositiveNumber(value) {
+    if (value === undefined || value === null || String(value).trim() === '') return undefined;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+// CLI 参数解析(目前只关心 --log-level / --help; 其余参数容忍, debug 记录)
+const cli = parseCliArgs(process.argv.slice(2));
+if (cli.help) {
+    console.log(usageText());
+    process.exit(0);
+}
+cli.errors.forEach((message) => logger.warn(`[CLI] ${message}`));
+if (cli.unknown.length) {
+    logger.debug('[CLI] Ignored unknown arguments', { args: cli.unknown });
+}
+
 // Default configuration
-// LOG_LEVEL 不在此声明默认值: 未显式配置时传 undefined 交给 startProxy 兜底(默认 info + 旧 DEBUG 开关联动)
+// LOG_LEVEL 不在此声明默认值: 优先级由 src/cli.js 统一解析(CLI > env > config.json > 旧 DEBUG > info)
 const defaultConfig = {
     PORT: 8083,
     API_KEY: '',
@@ -44,8 +63,22 @@ if (fs.existsSync(configPath)) {
     }
 }
 
-// Merge configs: env > file > default
-// 注: LOG_LEVEL 特例按需求为 env 优先于 config.json 的 logLevel 字段(与下方其他键的合并方向一致, 均为 env 在前)
+// 日志等级: CLI --log-level > env LOG_LEVEL > config.json LOG_LEVEL > 旧 DEBUG 开关 > 默认 info
+// 任一层非法值都会告警并继续尝试下一优先级, 全部无效则回退 info
+const legacyDebug = parseBool(
+    process.env.OPENCODE_PROXY_DEBUG,
+    parseBool(fileConfig.DEBUG, false)
+);
+const levelSettings = resolveLogLevelSettings({
+    cliLevel: cli.logLevel,
+    envLevel: process.env.LOG_LEVEL,
+    fileLevel: fileConfig.LOG_LEVEL,
+    legacyDebug
+});
+levelSettings.warnings.forEach((message) => logger.warn(`[Config] ${message}`));
+logger.setLevel(levelSettings.level);
+
+// 新增配置项的运行时优先级: env > config.json > 默认值(与既有键的合并方式一致)
 const finalConfig = {
     PORT: parseInt(process.env.PORT) || fileConfig.PORT || defaultConfig.PORT,
     API_KEY: process.env.API_KEY || fileConfig.API_KEY || defaultConfig.API_KEY,
@@ -54,9 +87,26 @@ const finalConfig = {
     OPENCODE_PATH: process.env.OPENCODE_PATH || fileConfig.OPENCODE_PATH || defaultConfig.OPENCODE_PATH,
     BIND_HOST: process.env.BIND_HOST || fileConfig.BIND_HOST || defaultConfig.BIND_HOST,
     DISABLE_TOOLS: parseBool(process.env.OPENCODE_DISABLE_TOOLS, parseBool(fileConfig.DISABLE_TOOLS, defaultConfig.DISABLE_TOOLS)),
-    // LOG_LEVEL: env 优先于 config.json; 均未显式设置时传 undefined,
-    // 由 startProxy 兜底默认 info 并保留旧 DEBUG 开关 -> debug 等级的联动
-    LOG_LEVEL: process.env.LOG_LEVEL || fileConfig.LOG_LEVEL || undefined
+    // 生效日志等级 + 来源(启动日志打印, proxy 内不再重新推断)
+    LOG_LEVEL: levelSettings.level,
+    LOG_LEVEL_SOURCE: levelSettings.source,
+    // 复杂任务: opencode 工作目录(默认空 -> proxy 用 jail 空目录)
+    OPENCODE_WORKDIR: process.env.OPENCODE_WORKDIR || fileConfig.OPENCODE_WORKDIR || '',
+    // 自动批准权限(默认开; 可用 env/config 关闭)
+    OPENCODE_AUTO_APPROVE: parseBool(process.env.OPENCODE_AUTO_APPROVE, parseBool(fileConfig.OPENCODE_AUTO_APPROVE, true)),
+    // 可选: 工具进度以 SSE 注释行输出
+    OPENCODE_STREAM_TOOLS: parseBool(process.env.OPENCODE_STREAM_TOOLS, parseBool(fileConfig.OPENCODE_STREAM_TOOLS, false)),
+    // 可选: tail opencode 日志文件(新行 debug 级转发)
+    OPENCODE_LOG_TAIL: parseBool(process.env.OPENCODE_LOG_TAIL, parseBool(fileConfig.OPENCODE_LOG_TAIL, false)),
+    OPENCODE_LOG_FILE: process.env.OPENCODE_LOG_FILE || fileConfig.OPENCODE_LOG_FILE || '',
+    // 可选: opencode serve --print-logs(把 opencode 日志并进容器日志)
+    OPENCODE_PRINT_LOGS: parseBool(process.env.OPENCODE_PRINT_LOGS, parseBool(fileConfig.OPENCODE_PRINT_LOGS, false)),
+    // 系统提示词提升规则: JSON 数组 / 分号分隔正则; 未配置(含空字符串)用内置默认标记
+    SYSTEM_PROMPT_PATTERNS: resolvePatternsSetting(process.env.SYSTEM_PROMPT_PATTERNS, fileConfig.SYSTEM_PROMPT_PATTERNS),
+    // 超时/心跳: 未配置时由 proxy 内置默认值兜底(300000 / 60000 / 15000)
+    REQUEST_TIMEOUT_MS: parseOptionalPositiveNumber(process.env.REQUEST_TIMEOUT_MS ?? fileConfig.REQUEST_TIMEOUT_MS),
+    EVENT_IDLE_TIMEOUT_MS: parseOptionalPositiveNumber(process.env.OPENCODE_EVENT_IDLE_TIMEOUT_MS ?? fileConfig.EVENT_IDLE_TIMEOUT_MS),
+    SSE_HEARTBEAT_MS: parseOptionalPositiveNumber(process.env.OPENCODE_SSE_HEARTBEAT_MS ?? fileConfig.SSE_HEARTBEAT_MS)
 };
 
 // Validate required configuration
@@ -86,15 +136,26 @@ logger.info(`  - Bind Host for OpenCode backend: ${finalConfig.OPENCODE_BIND_HOS
 logger.info(`  - OpenCode Path: ${finalConfig.OPENCODE_PATH}`);
 logger.info(`  - API Key: ${finalConfig.API_KEY ? 'Configured' : 'Not configured (no auth)'}`);
 logger.info(`  - Disable Tools: ${finalConfig.DISABLE_TOOLS ? 'Yes' : 'No'}`);
-logger.info(`  - Log Level (requested): ${finalConfig.LOG_LEVEL || 'info (default)'}`);
+logger.info(`  - Log Level (effective): ${finalConfig.LOG_LEVEL} (source: ${finalConfig.LOG_LEVEL_SOURCE})`);
+logger.info(`  - OpenCode Workdir: ${finalConfig.OPENCODE_WORKDIR || '(jail empty workspace)'}`);
+logger.info(`  - Auto Approve Permissions: ${finalConfig.OPENCODE_AUTO_APPROVE ? 'Yes' : 'No'}`);
+logger.info(`  - Stream Tool Progress (SSE comments): ${finalConfig.OPENCODE_STREAM_TOOLS ? 'Yes' : 'No'}`);
+logger.info(`  - Tail OpenCode Log: ${finalConfig.OPENCODE_LOG_TAIL ? `Yes (${finalConfig.OPENCODE_LOG_FILE || 'auto-detect'})` : 'No'}`);
+logger.info(`  - Print OpenCode Logs (--print-logs): ${finalConfig.OPENCODE_PRINT_LOGS ? 'Yes' : 'No'}`);
+logger.info(`  - System Prompt Patterns: ${finalConfig.SYSTEM_PROMPT_PATTERNS ? `configured (${String(finalConfig.SYSTEM_PROMPT_PATTERNS).slice(0, 200)})` : 'default (built-in dsh markers)'}`);
+if (finalConfig.REQUEST_TIMEOUT_MS) logger.info(`  - Request Timeout: ${finalConfig.REQUEST_TIMEOUT_MS}ms`);
+if (levelSettings.warnings.length) {
+    logger.warn(`[Config] Log level warnings: ${levelSettings.warnings.join(' | ')}`);
+}
 
 // Start the proxy
 try {
     const proxy = startProxy(finalConfig);
-    
+
     // Handle graceful shutdown
     process.on('SIGINT', () => {
         logger.info('[Shutdown] Received SIGINT, shutting down gracefully...');
+        proxy.stopLogTail();
         proxy.killBackend();
         proxy.server.close(() => {
             logger.info('[Shutdown] Server closed');
@@ -104,6 +165,7 @@ try {
 
     process.on('SIGTERM', () => {
         logger.info('[Shutdown] Received SIGTERM, shutting down gracefully...');
+        proxy.stopLogTail();
         proxy.killBackend();
         proxy.server.close(() => {
             logger.info('[Shutdown] Server closed');

@@ -35,7 +35,11 @@ RUN npm install -g opencode-ai
 # 备选方式(若 npm 包安装有问题, 可换官方安装脚本):
 # RUN curl -fsSL https://opencode.ai/install | bash
 
-# 入口脚本: 首次启动按 docker run -e 环境变量生成 /app/config.json(支持 PORT/API_KEY/BIND_HOST/DISABLE_TOOLS/OPENCODE_PATH/OPENCODE_SERVER_URL/OPENCODE_BIND_HOST)
+# 入口脚本: 首次启动按 docker run -e 环境变量生成 /app/config.json
+# 支持 PORT/API_KEY/BIND_HOST/DISABLE_TOOLS/OPENCODE_PATH/OPENCODE_SERVER_URL/OPENCODE_BIND_HOST,
+# 以及 OPENCODE_AUTO_APPROVE/OPENCODE_WORKDIR/OPENCODE_STREAM_TOOLS/OPENCODE_LOG_TAIL/OPENCODE_LOG_FILE/
+# OPENCODE_PRINT_LOGS/SYSTEM_PROMPT_PATTERNS/REQUEST_TIMEOUT_MS/OPENCODE_EVENT_IDLE_TIMEOUT_MS/OPENCODE_SSE_HEARTBEAT_MS
+# 运行时优先级: 环境变量 > config.json > 内置默认; CLI --log-level 只影响日志等级且优先级最高
 # 该文件不在上游源码里, 由 workflow 在构建前从本仓库复制进构建上下文(project 目录)
 COPY docker/docker-entrypoint.sh /app/docker-entrypoint.sh
 RUN chmod +x /app/docker-entrypoint.sh
@@ -43,12 +47,17 @@ RUN chmod +x /app/docker-entrypoint.sh
 # 网关监听端口(与 docker-entrypoint.sh 生成的 config.json 默认 PORT 一致)
 EXPOSE 8083
 
-# 日志等级声明(默认 info, 可选 error/warn/info/debug, 不区分大小写, 非法值回退 info 并告警):
-# docker run -e LOG_LEVEL=debug 覆盖此默认值; LOG_LEVEL 由 node 进程直读环境变量,
-# 优先级高于 config.json 里的 LOG_LEVEL 字段(env 优先)。级别越高日志越细:
-#   info: 启动信息 + 每个请求一行摘要(方法/路径/模型/流式/状态码/耗时/请求id)
-#   debug: 额外输出转发给 opencode 的最终请求体、完整响应(非流式 JSON/流式 SSE 结束汇总)
-#   error: 上游(4097)请求失败/错误必输出, 含状态码与错误体摘要
+# 日志等级声明(默认 info, 可选 error/warn/info/debug, 不区分大小写, 非法值告警并继续降级, 最终回退 info):
+# docker run -e LOG_LEVEL=debug 覆盖此默认值; CLI --log-level 优先级最高:
+#   docker run ... adockero/opencode-to-openai node index.js --log-level debug
+# 优先级: CLI --log-level > env LOG_LEVEL > config.json LOG_LEVEL > 旧 DEBUG 开关 > 默认 info
+# 级别越高日志越细:
+#   info: 启动信息 + 每请求阶段日志(收到请求/后端就绪/session/prompt/首个增量/完成)
+#         + opencode 工具执行与权限自动批准摘要
+#   debug: 额外输出完整入站请求体(脱敏)、最终 upstream payload 摘要、opencode 事件流细节、
+#          上游响应全文(流式累计文本 + 非流式完整 JSON)、OPENCODE_LOG_TAIL 转发的 opencode 日志
+#   warn: 请求超时(带卡住的阶段)、上游 429/retry-after、非法等级告警
+#   error: 上游(4097)请求失败/错误必输出, 含 phase/状态码/retry-after/错误体摘要
 ENV LOG_LEVEL=info
 
 # opencode serve 后端端口(4097)
