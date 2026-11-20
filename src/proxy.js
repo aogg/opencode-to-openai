@@ -42,7 +42,9 @@ const STARTUP_WAIT_ITERATIONS = 60;
 const STARTUP_WAIT_INTERVAL_MS = 2000;
 const STARTING_WAIT_ITERATIONS = 120;
 const STARTING_WAIT_INTERVAL_MS = 1000;
-const DEFAULT_REQUEST_TIMEOUT_MS = 300000;
+/* 30 分钟: 必须大于 PROGRESS_LOG_INTERVAL_MS / STALL_WARN_MS(默认都是 5 分钟),
+ * 否则长任务(如 bash 里 sleep 320)会在 5 分钟被硬超时打断, 看门狗告警也永远来不及触发 */
+const DEFAULT_REQUEST_TIMEOUT_MS = 1800000;
 const DEFAULT_POLL_INTERVAL_MS = 500;
 const DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS = 4000;
 /* 工具任务期间可能长时间没有文本增量, 空闲超时从 8s 放宽到 60s, 且工具活动会重置计时 */

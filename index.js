@@ -110,7 +110,7 @@ const finalConfig = {
     OPENCODE_PRINT_LOGS: parseBool(process.env.OPENCODE_PRINT_LOGS, parseBool(fileConfig.OPENCODE_PRINT_LOGS, false)),
     // 系统提示词提升规则: JSON 数组 / 分号分隔正则; 未配置(含空字符串)用内置默认标记
     SYSTEM_PROMPT_PATTERNS: resolvePatternsSetting(process.env.SYSTEM_PROMPT_PATTERNS, fileConfig.SYSTEM_PROMPT_PATTERNS),
-    // 超时/心跳: 未配置时由 proxy 内置默认值兜底(300000 / 60000 / 15000)
+    // 超时/心跳: 未配置时由 proxy 内置默认值兜底(1800000 / 60000 / 15000)
     REQUEST_TIMEOUT_MS: parseOptionalPositiveNumber(process.env.REQUEST_TIMEOUT_MS ?? fileConfig.REQUEST_TIMEOUT_MS),
     EVENT_IDLE_TIMEOUT_MS: parseOptionalPositiveNumber(process.env.OPENCODE_EVENT_IDLE_TIMEOUT_MS ?? fileConfig.EVENT_IDLE_TIMEOUT_MS),
     SSE_HEARTBEAT_MS: parseOptionalPositiveNumber(process.env.OPENCODE_SSE_HEARTBEAT_MS ?? fileConfig.SSE_HEARTBEAT_MS),

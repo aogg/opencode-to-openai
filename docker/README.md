@@ -92,13 +92,15 @@ curl -X POST http://127.0.0.1:8083/v1/chat/completions \
 | `OPENCODE_LOG_FILE` | 空(自动探测) | 配合 `OPENCODE_LOG_TAIL`,显式指定要 tail 的 opencode 日志文件路径 |
 | `OPENCODE_PRINT_LOGS` | `false` | 给 `opencode serve` 加 `--print-logs`(并带 `--log-level DEBUG/INFO`,与网关日志等级联动),opencode 自己的日志直接并进容器日志 |
 | `SYSTEM_PROMPT_PATTERNS` | 内置 dsh 标记 | 把命中规则的 **role=user** 消息内容提升到 `prompt.body.system`(不再拼进 user parts),解决"模型先复述系统提示词"。支持 JSON 数组或分号/换行/逗号分隔的正则;设 `none`/`off`/`[]` 关闭提升;非法正则告警并跳过 |
-| `REQUEST_TIMEOUT_MS` | `300000` | 单次请求总超时(毫秒),超时返回 504,日志带"卡在哪一阶段" |
+| `REQUEST_TIMEOUT_MS` | `1800000` | 单次请求总超时(毫秒,默认 30 分钟),超时返回 504,日志带"卡在哪一阶段"。**必须大于 `PROGRESS_LOG_INTERVAL_MS` / `STALL_WARN_MS`**(默认满足:30 分钟 > 5 分钟),否则长任务会被请求超时打断,看门狗的 `Stalled request` 告警也永远来不及触发 |
 | `OPENCODE_EVENT_IDLE_TIMEOUT_MS` | `60000` | 事件流空闲超时(毫秒),文本增量/工具活动都会重置;超时后回退轮询兜底 |
 | `OPENCODE_SSE_HEARTBEAT_MS` | `15000` | 流式期间 SSE 注释心跳间隔(`: ping`),避免长任务被客户端/中间层当空闲断开 |
 | `FAST_FAIL_RETRY_MS` | `60000` | 上游 `session.status=retry` 的等待上限(毫秒)。`nextInMs` 超过它**或** message 命中额度类文案(`free usage`/`usage exceeded`/`quota`/`subscribe`/`rate limit` 等)时立即结束请求:非流式返回 HTTP 429(`type=gateway_upstream_retry`),流式先发一条 SSE error 事件再结束;同时尽力调用 `session.abort` 取消上游。`0` = 关闭阈值判断(额度类文案仍然快速失败) |
 | `QUEUE_MAX_WAIT_MS` | `60000` | 单并发队列的排队上限(毫秒)。排队超过上限直接返回 HTTP 503(`type=gateway_queue_timeout`),避免上游卡住时后续请求无限排队(线上曾排了 298 秒);`0` = 不限制(旧行为) |
 | `PROGRESS_LOG_INTERVAL_MS` | `300000` | 每个在途请求每满一个间隔输出一条 INFO 进度日志(`reqId`/`phase`/`elapsedMs`/`idleMs`/`sessionId`/`model`/`stream`/`deltaChars`/`lastEvent`/`queueWaitMs`);`0` = 关闭 |
 | `STALL_WARN_MS` | `300000` | 看门狗把"这么久没有活动"的请求判定为卡住,每 30 秒扫描一次并打 WARN `[Proxy] Stalled request`(同一请求每个窗口最多一次);`0` = 关闭 |
+
+> **超时关系**:`REQUEST_TIMEOUT_MS`(默认 1800000ms = 30 分钟)必须大于 `PROGRESS_LOG_INTERVAL_MS` 与 `STALL_WARN_MS`(默认都是 300000ms = 5 分钟)。这样复杂长任务(例如让模型用 bash 执行 `sleep 320` 这类长命令)能跑完,而看门狗也能在请求 5 分钟无活动时先打出 WARN `[Proxy] Stalled request`,而不是被请求超时提前 504 收场;调大 `REQUEST_TIMEOUT_MS` 时请连带确认它仍大于进度的两个间隔。
 
 示例(开启鉴权):
 
@@ -140,7 +142,7 @@ docker run -d --restart=always --name opencode-to-openai -p 8083:8083 -e LOG_LEV
 ```text
 # info(默认): 启动信息 + 每请求阶段日志 + opencode 工具/权限摘要
 [gateway] 2026-11-20T07:00:15.000Z [INFO] Log level: info (source: env LOG_LEVEL)
-[gateway] 2026-11-20T07:00:15.010Z [INFO] [Proxy] Runtime options {"workdir":"(jail empty workspace)","autoApprovePermissions":true,"streamToolProgress":false,"printOpencodeLogs":false,"tailOpencodeLog":false,"requestTimeoutMs":300000,"eventIdleTimeoutMs":60000,"sseHeartbeatMs":15000}
+[gateway] 2026-11-20T07:00:15.010Z [INFO] [Proxy] Runtime options {"workdir":"(jail empty workspace)","autoApprovePermissions":true,"streamToolProgress":false,"printOpencodeLogs":false,"tailOpencodeLog":false,"requestTimeoutMs":1800000,"eventIdleTimeoutMs":60000,"sseHeartbeatMs":15000}
 [gateway] 2026-11-20T07:00:15.401Z [INFO] [Proxy] Request received {"reqId":"gw-mwo...","model":"opencode/kimi-k2.5-free","stream":true,"messages":3,"lastUser":"请回答问题","hasSystem":true,"systemChars":31,"promotedSystemMessages":1,"promotedChars":21,"parts":1}
 [gateway] 2026-11-20T07:00:15.405Z [INFO] [Proxy] Backend ready {"reqId":"gw-mwo...","ms":1,"spawned":false,"workdir":"/code/www/my/github/demo"}
 [gateway] 2026-11-20T07:00:15.412Z [INFO] [Proxy] Session created {"reqId":"gw-mwo...","sessionId":"ses_1","ms":6,"workdir":"/code/www/my/github/demo"}
