@@ -9,9 +9,10 @@
   },
   "scripts": {
     "start": "node index.js",
-    "test": "node test/it-test.mjs && node test/gateway-test.mjs",
+    "test": "node test/it-test.mjs && node test/gateway-test.mjs && node test/prompt-async-test.mjs",
     "test:it": "node test/it-test.mjs",
-    "test:gateway": "node test/gateway-test.mjs"
+    "test:gateway": "node test/gateway-test.mjs",
+    "test:prompt-async": "node test/prompt-async-test.mjs"
   },
   "keywords": [
     "opencode",

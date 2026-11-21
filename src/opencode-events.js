@@ -95,6 +95,19 @@ export function extractFromParts(parts) {
     return { content, reasoning };
 }
 
+/** 上游每一轮(step)的中间态 finish: 不代表本轮结束, 上游会新建 assistant 消息继续跑 */
+export const NON_TERMINAL_ASSISTANT_FINISH = ['tool-calls', 'unknown'];
+
+/**
+ * assistant 消息的 finish 是否代表本轮结束
+ * 与 opencode session/prompt.ts 的 loop 退出条件一致: finish 存在且不是 tool-calls/unknown。
+ * @param {string|null|undefined} finish
+ * @returns {boolean}
+ */
+export function isTerminalAssistantFinish(finish) {
+    return typeof finish === 'string' && finish.length > 0 && !NON_TERMINAL_ASSISTANT_FINISH.includes(finish);
+}
+
 /**
  * 订阅并收集一次 prompt 的事件
  *
@@ -541,7 +554,12 @@ export function collectSessionEvents(options) {
                 errorMessage: previewText(info.error.data?.message || info.error.message, 300)
             });
         }
-        if (info.finish === 'stop') {
+        /*
+         * 本轮结束判定(与上游 loop 一致):
+         * - 中间 step 的 finish=tool-calls/unknown 不是结束, 上游会继续跑并写新的 assistant 消息;
+         * - 终态 finish(stop/length/...)或 error 才是结束, 收集器立刻结束, 交给调用方收尾。
+         */
+        if (info.error || isTerminalAssistantFinish(info.finish)) {
             finish({ error: state.assistantError }, 'message-finished');
             return;
         }
@@ -711,6 +729,23 @@ export function collectSessionEvents(options) {
             }
             if (type === 'session.status') {
                 handleSessionStatus(event);
+                continue;
+            }
+            if (type === 'session.error') {
+                /* 提交期/生成期失败(如 provider 鉴权、模型不存在)可能没有可轮询的 assistant 消息,
+                   必须在这里结束收集, 否则 promptAsync 路径会一直轮询到总超时 */
+                const properties = event.properties || {};
+                /* 只认本会话: 全局事件流里可能有别的会话/没有 sessionID 的错误, 不能算到当前请求头上 */
+                if (properties.sessionID !== sessionId) continue;
+                const sessionError = properties.error || null;
+                state.assistantError = sessionError;
+                logger.error('[opencode] session error event', {
+                    reqId,
+                    sessionId,
+                    errorName: sessionError?.name || null,
+                    errorMessage: previewText(sessionError?.data?.message || sessionError?.message, 300)
+                });
+                finish({ error: sessionError || new Error('OpenCode session error'), sessionError: true }, 'session-error');
                 continue;
             }
             if (type === 'session.idle') {

@@ -15,14 +15,18 @@ import {
     previewText,
     summarizeUpstreamPayload
 } from './prompt-builder.js';
-import { collectSessionEvents, extractFromParts } from './opencode-events.js';
+import { collectSessionEvents } from './opencode-events.js';
 import { buildEchoPatterns, sanitizeAssistantText } from './output-guard.js';
 import {
     DEFAULT_FAST_FAIL_RETRY_MS,
     buildRetryFailure,
-    isUpstreamRetryError,
-    waitForPrompt
+    isUpstreamRetryError
 } from './retry-guard.js';
+import {
+    DEFAULT_POLL_INTERVAL_MS,
+    pollForAssistantResponse,
+    submitPromptAsync
+} from './prompt-async.js';
 import {
     DEFAULT_PROGRESS_LOG_INTERVAL_MS,
     DEFAULT_STALL_WARN_MS,
@@ -45,7 +49,6 @@ const STARTING_WAIT_INTERVAL_MS = 1000;
 /* 30 分钟: 必须大于 PROGRESS_LOG_INTERVAL_MS / STALL_WARN_MS(默认都是 5 分钟),
  * 否则长任务(如 bash 里 sleep 320)会在 5 分钟被硬超时打断, 看门狗告警也永远来不及触发 */
 const DEFAULT_REQUEST_TIMEOUT_MS = 1800000;
-const DEFAULT_POLL_INTERVAL_MS = 500;
 const DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS = 4000;
 /* 工具任务期间可能长时间没有文本增量, 空闲超时从 8s 放宽到 60s, 且工具活动会重置计时 */
 const DEFAULT_EVENT_IDLE_TIMEOUT_MS = 60000;
@@ -64,10 +67,6 @@ const OPENCODE_BASENAME = 'opencode';
 function splitPathEnv() {
     const raw = process.env.PATH || '';
     return raw.split(path.delimiter).filter(Boolean);
-}
-
-function sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function pushDir(list, dir) {
@@ -539,16 +538,6 @@ export function createApp(config) {
     };
 
     /**
-     * 带超时的上游 prompt 调用; 传 fastFailPromise 时收到快速失败信号立即返回(不等 300s 超时定时器)
-     * @param {object} promptParams client.session.prompt 参数
-     * @param {number} timeoutMs 总超时
-     * @param {Promise<object>|null} fastFailPromise collector.fastFailPromise
-     */
-    async function promptWithTimeout(promptParams, timeoutMs, fastFailPromise = null) {
-        return waitForPrompt(client.session.prompt(promptParams), timeoutMs, fastFailPromise);
-    }
-
-    /**
      * 输出侧兜底: 裁掉 assistant 内容里的系统注入片段(非流式/轮询路径), 命中时 WARN 便于排查
      * @param {string} text 上游汇总出来的 assistant 文本
      * @param {{reqId?: string|null, sessionId?: string|null, channel?: string, source?: string}} meta
@@ -567,61 +556,6 @@ export function createApp(config) {
             });
         }
         return result.text;
-    }
-
-    /**
-     * 轮询兜底: 取最近一条 assistant 消息的正文/推理
-     * - 只认 role=assistant 的消息(上游把 user/system 内容塞进 assistant part 的极端情况由 sanitizeAssistantOutput 兜底)
-     * - 轮询期间收到快速失败信号立即抛 UpstreamRetryError
-     * @param {string} sessionId
-     * @param {number} timeoutMs
-     * @param {number} intervalMs
-     * @param {{getFastFail?: Function, reqId?: string|null}} [options]
-     */
-    async function pollForAssistantResponse(sessionId, timeoutMs, intervalMs = DEFAULT_POLL_INTERVAL_MS, options = {}) {
-        const getFastFail = typeof options.getFastFail === 'function' ? options.getFastFail : null;
-        const reqId = options.reqId || null;
-        const pollStart = Date.now();
-        const startedAt = Date.now();
-        while (Date.now() - startedAt < timeoutMs) {
-            const fastFailInfo = getFastFail ? getFastFail() : null;
-            if (fastFailInfo) {
-                throw new UpstreamRetryError(fastFailInfo);
-            }
-            const messagesRes = await client.session.messages({ path: { id: sessionId } });
-            const messages = messagesRes?.data || messagesRes || [];
-            if (Array.isArray(messages) && messages.length) {
-                for (let i = messages.length - 1; i >= 0; i -= 1) {
-                    const entry = messages[i];
-                    const info = entry?.info;
-                    if (info?.role !== 'assistant') continue;
-                    const raw = extractFromParts(entry?.parts || []);
-                    /* 输出侧兜底: 即使上游把 user/system 文本当 assistant part 回显, 这里也不会下发 */
-                    const content = sanitizeAssistantOutput(raw.content, { reqId, sessionId, channel: 'content', source: 'poll' });
-                    const reasoning = sanitizeAssistantOutput(raw.reasoning, { reqId, sessionId, channel: 'reasoning', source: 'poll' });
-                    const error = info?.error || null;
-                    const done = Boolean(info.finish || info.time?.completed || error);
-                    if (done || content || reasoning) {
-                        if (error) {
-                            logger.error('[Proxy] OpenCode assistant error:', { reqId, sessionId, error });
-                        }
-                        logDebug('Polling completed', {
-                            reqId,
-                            sessionId,
-                            ms: Date.now() - pollStart,
-                            done,
-                            contentLen: content.length,
-                            reasoningLen: reasoning.length,
-                            error: error ? error.name : null
-                        });
-                        return { content, reasoning, error };
-                    }
-                }
-            }
-            await sleep(intervalMs);
-        }
-        logDebug('Polling timeout', { reqId, sessionId, ms: Date.now() - pollStart });
-        throw new Error(`Request timeout after ${timeoutMs}ms`);
     }
 
     /** 尽力删除会话(错误/快速失败收尾), 失败只告警 */
@@ -847,6 +781,20 @@ export function createApp(config) {
                 disableTools: DISABLE_TOOLS
             }));
 
+            /*
+             * 总超时预算: promptAsync 提交 + SSE 完成等待 + 轮询兜底共用同一个 REQUEST_TIMEOUT_MS,
+             * 不会因为"先提交、再等待"叠成两倍; 轮询兜底只拿剩余预算。
+             */
+            const promptDeadline = Date.now() + REQUEST_TIMEOUT_MS;
+            const remainingPromptMs = () => Math.max(0, promptDeadline - Date.now());
+            /* 轮询结果的回显裁剪(与旧实现同一套标记, 只是移到了 src/prompt-async.js) */
+            const sanitizePolledOutput = (text, channel) => sanitizeAssistantOutput(text, {
+                reqId,
+                sessionId,
+                channel,
+                source: 'poll'
+            });
+
             if (stream) {
                 res.setHeader('Content-Type', 'text/event-stream');
                 res.setHeader('Cache-Control', 'no-cache');
@@ -918,13 +866,22 @@ export function createApp(config) {
                     if (!fastFailInfo) {
                         const promptStart = Date.now();
                         try {
-                            /* promptWithTimeout 会同时 race 快速失败信号: 上游额度耗尽时立即返回, 不等 300s */
-                            const promptResult = await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS, collector.fastFailPromise);
+                            /*
+                             * 提交改用 promptAsync(服务端 204 立即返回, 后台继续跑): 不再用 session.prompt
+                             * 占着一条 HTTP 连接等模型跑完, 否则 Node fetch 默认 300s bodyTimeout 会掐断长任务。
+                             */
+                            const promptResult = await submitPromptAsync(client, promptParams, {
+                                timeoutMs: remainingPromptMs(),
+                                fastFailPromise: collector.fastFailPromise,
+                                reqId,
+                                logger
+                            });
                             assertNoUpstreamError(promptResult, 'Send prompt');
                             logger.info('[Proxy] Prompt sent', {
                                 reqId,
                                 sessionId,
                                 ms: Date.now() - promptStart,
+                                async: true,
                                 parts: parts.length,
                                 systemChars: systemWithGuard ? systemWithGuard.length : 0
                             });
@@ -952,18 +909,56 @@ export function createApp(config) {
                     return;
                 }
 
-                /* 兜底轮询: 轮询期间收到 retry 快速失败时转成 fastFailInfo, 走同样的 SSE error 收尾 */
-                const pollFallback = () => pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS, DEFAULT_POLL_INTERVAL_MS, {
+                /* 提交/生成期的会话级错误(如模型不存在): 没有可轮询的 assistant 消息, 直接按错误收尾 */
+                if (collected && collected.sessionError) {
+                    const sessionFailure = collected.error || {};
+                    const failureText = sessionFailure.data?.message || sessionFailure.message || 'Unknown error';
+                    sendDelta(`[Proxy Error] ${sessionFailure.name || 'OpenCodeError'}: ${failureText}`);
+                    if (writeSse(`data: ${JSON.stringify({ id, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`)) sseChunkCount++;
+                    writeSse('data: [DONE]\n\n');
+                    if (!res.writableEnded) res.end();
+                    logger.warn('[Proxy] Upstream session error', {
+                        reqId,
+                        sessionId,
+                        stream: true,
+                        elapsedMs: Date.now() - requestStartedAt,
+                        message: failureText
+                    });
+                    await deleteSessionQuietly(sessionId, reqId);
+                    return;
+                }
+
+                /* 兜底轮询: 必须等到 assistant 本轮终态; 轮询期间收到 retry 快速失败时转成 fastFailInfo 收尾 */
+                const pollFallback = () => pollForAssistantResponse({
+                    client,
+                    sessionId,
+                    timeoutMs: remainingPromptMs(),
+                    intervalMs: DEFAULT_POLL_INTERVAL_MS,
+                    requireDone: true,
                     getFastFail: collector.getFastFail,
-                    reqId
+                    reqId,
+                    logger,
+                    sanitize: sanitizePolledOutput
                 });
 
+                /* SSE 拿到的是不是"本轮已完成"的确定信号: 空闲/首包/断流/超时都不算 */
+                const completionConfirmed = Boolean(
+                    collected
+                    && collected.reason === 'message-finished'
+                    && !collected.error
+                    && !collected.timedOut
+                    && !collected.noData
+                    && !collected.idleTimeout
+                    && !collected.sessionError
+                );
+
                 try {
-                    if (!collected || collected.error || collected.timedOut) {
-                        logger.debug('SSE collect error, falling back to polling', {
+                    if (!completionConfirmed) {
+                        logger.debug('SSE completion not confirmed, polling until assistant finishes', {
+                            reqId,
                             sessionId,
-                            error: collected?.error?.message || null,
-                            reason: collected?.reason || 'none'
+                            reason: collected?.reason || 'none',
+                            error: collected?.error?.message || null
                         });
                         const { content, reasoning, error } = await pollFallback();
                         if (error && !content && !reasoning) {
@@ -971,28 +966,7 @@ export function createApp(config) {
                         } else {
                             const safeReasoning = stripFunctionCalls(reasoning, false);
                             const safeContent = stripFunctionCalls(content, false);
-                            if (safeReasoning) sendDelta(safeReasoning, true);
-                            if (safeContent) sendDelta(safeContent, false);
-                        }
-                    } else if (collected && collected.noData) {
-                        logDebug('Fallback to polling (stream)', { sessionId });
-                        const { content, reasoning, error } = await pollFallback();
-                        if (error && !content && !reasoning) {
-                            sendDelta(`[Proxy Error] ${error.name || 'OpenCodeError'}: ${error.data?.message || error.message || 'Unknown error'}`);
-                        } else {
-                            const safeReasoning = stripFunctionCalls(reasoning, false);
-                            const safeContent = stripFunctionCalls(content, false);
-                            if (safeReasoning) sendDelta(safeReasoning, true);
-                            if (safeContent) sendDelta(safeContent, false);
-                        }
-                    } else if (collected && collected.idleTimeout) {
-                        logDebug('SSE idle timeout, polling for completion', { sessionId });
-                        const { content, reasoning, error } = await pollFallback();
-                        if (error && !content && !reasoning) {
-                            sendDelta(`[Proxy Error] ${error.name || 'OpenCodeError'}: ${error.data?.message || error.message || 'Unknown error'}`);
-                        } else {
-                            const safeReasoning = stripFunctionCalls(reasoning, false);
-                            const safeContent = stripFunctionCalls(content, false);
+                            /* 事件流已下发的部分不重复下发(按增量前缀对齐) */
                             const remainingReasoning = safeReasoning && safeReasoning.startsWith(streamedReasoning)
                                 ? safeReasoning.slice(streamedReasoning.length)
                                 : safeReasoning;
@@ -1002,10 +976,8 @@ export function createApp(config) {
                             if (remainingReasoning) sendDelta(remainingReasoning, true);
                             if (remainingContent) sendDelta(remainingContent, false);
                         }
-                    }
-
-                    /* opencode>=1.19 SSE delta 缺失时 assistant 快速 finish 会带空内容提前 resolve, 这里兜底轮询一次取完整回复再下发, 轮询也无内容则不发任何 delta */
-                    if (collected && !streamedContent && !streamedReasoning) {
+                    } else if (collected && !streamedContent && !streamedReasoning) {
+                        /* 事件流已完成但没拿到增量(部分版本 SSE 无 delta): 兜底轮询一次取全文再下发 */
                         const { content: polledContent, reasoning: polledReasoning } = await pollFallback();
                         const safePolledReasoning = stripFunctionCalls(polledReasoning, false);
                         const safePolledContent = stripFunctionCalls(polledContent, false);
@@ -1060,20 +1032,61 @@ export function createApp(config) {
                     if (!fastFailInfo) {
                         const promptStart = Date.now();
                         try {
-                            const promptResult = await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS, collector.fastFailPromise);
+                            /* promptAsync 提交(短调用): 长任务不再占用会被 300s fetch 超时掐断的连接 */
+                            const promptResult = await submitPromptAsync(client, promptParams, {
+                                timeoutMs: remainingPromptMs(),
+                                fastFailPromise: collector.fastFailPromise,
+                                reqId,
+                                logger
+                            });
                             assertNoUpstreamError(promptResult, 'Send prompt');
                             logger.info('[Proxy] Prompt sent', {
                                 reqId,
                                 sessionId,
                                 ms: Date.now() - promptStart,
+                                async: true,
                                 parts: parts.length,
                                 systemChars: systemWithGuard ? systemWithGuard.length : 0
                             });
-                            setPhase('poll');
-                            pollResult = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS, DEFAULT_POLL_INTERVAL_MS, {
+
+                            /*
+                             * 等待本轮结束: 优先 SSE 完成信号(collector.promise), 事件流断流/静默时由轮询兜底。
+                             * 两路同时跑、共用同一个总预算, 谁先给出结论用谁 —— 不会因为 SSE 静默就干等到超时。
+                             */
+                            setPhase('collect');
+                            const pollAbort = new AbortController();
+                            const pollPromise = pollForAssistantResponse({
+                                client,
+                                sessionId,
+                                timeoutMs: remainingPromptMs(),
+                                intervalMs: DEFAULT_POLL_INTERVAL_MS,
+                                requireDone: true,
                                 getFastFail: collector.getFastFail,
-                                reqId
+                                reqId,
+                                logger,
+                                sanitize: sanitizePolledOutput,
+                                signal: pollAbort.signal
                             });
+                            const first = await Promise.race([
+                                collector.promise.then((collected) => ({ source: 'sse', collected })),
+                                pollPromise.then((result) => ({ source: 'poll', result }))
+                            ]);
+                            if (first.source === 'poll') {
+                                pollResult = first.result;
+                            } else if (first.collected && first.collected.fastFail) {
+                                fastFailInfo = first.collected.fastFail;
+                                /* 已拿到快速失败结论: 停掉还在跑的轮询, 只吞掉它的 rejection(不再等它) */
+                                pollAbort.abort();
+                                pollPromise.catch(() => null);
+                            } else if (first.collected && first.collected.sessionError) {
+                                pollResult = { content: '', reasoning: '', error: first.collected.error };
+                                pollAbort.abort();
+                                pollPromise.catch(() => null);
+                            } else {
+                                /* SSE 已给出本轮终态: 轮询此时会立刻返回最终内容(失败/超时也在这里收尾) */
+                                setPhase('poll');
+                                pollResult = await pollPromise;
+                            }
                         } catch (error) {
                             if (isUpstreamRetryError(error)) {
                                 fastFailInfo = error.info;
