@@ -34,6 +34,7 @@ import {
     createSerialQueue,
     isQueueTimeoutError
 } from '../src/serial-queue.js';
+import { startStreamHeartbeat } from '../src/stream-heartbeat.js';
 
 const SESSION_ID = 'ses_gateway_test';
 
@@ -562,6 +563,103 @@ test('R4 定时器不泄漏: 请求移除/注册表 stop 后进度定时器不�
         countAfterStop,
         'stop() 后不得再输出进度日志'
     );
+});
+
+/* ================================================================== */
+/* R6: 流式心跳必须是合法空增量分片                                     */
+/* 背景: 只发 `: ping` 注释不产生事件块, 客户端(pi-ai idleWatchdog     */
+/* 默认 300s)会在长任务中途判空闲超时, DSH 在 4 分多显示"已停止"。     */
+/* ================================================================== */
+
+/** 收集 writeSse 写入的 SSE 文本 */
+function createSseSink() {
+    const writes = [];
+    const writeSse = (text) => {
+        writes.push(text);
+        return true;
+    };
+    return { writes, writeSse };
+}
+
+/** 取出所有 data 帧并解析成 chunk(忽略注释行与 [DONE]) */
+function parseSseDataFrames(writes) {
+    return writes
+        .filter((text) => text.startsWith('data: ') && !text.includes('[DONE]'))
+        .map((text) => JSON.parse(text.slice('data: '.length).trim()));
+}
+
+test('R6 心跳分片: 合法 JSON + delta 空对象 + finish_reason=null + id/model/created 用请求真值', () => {
+    const { writes, writeSse } = createSseSink();
+    const heartbeat = startStreamHeartbeat({
+        writeSse,
+        id: 'chatcmpl-req42',
+        model: 'opencode/kimi-k2.5-free',
+        created: 1700000000,
+        intervalMs: 60000
+    });
+    assert.equal(heartbeat.tick(), true);
+    heartbeat.stop();
+
+    assert.equal(writes[0], ': ping\n\n', '心跳保留 : ping 注释行(兼容只认注释的中间层)');
+    const frames = parseSseDataFrames(writes);
+    assert.equal(frames.length, 1, '每次心跳必须写出一条 data 分片, 注释本身不产生事件块');
+    const chunk = frames[0];
+    assert.equal(chunk.object, 'chat.completion.chunk');
+    assert.equal(chunk.id, 'chatcmpl-req42');
+    assert.equal(chunk.model, 'opencode/kimi-k2.5-free');
+    assert.equal(chunk.created, 1700000000, 'created 整轮固定, 不随心跳变化');
+    assert.deepEqual(chunk.choices[0].delta, {}, '空增量: delta 必须是空对象');
+    assert.equal(chunk.choices[0].finish_reason, null, '心跳不是终止分片');
+});
+
+test('R6 心跳不污染内容块计数: 只累计 heartbeats, chunks 仍为 0', async () => {
+    const { writes, writeSse } = createSseSink();
+    /* 模拟 proxy 的 sseChunkCount: 只有内容/终止分片才 +1, 心跳不参与 */
+    let contentChunks = 0;
+    const heartbeat = startStreamHeartbeat({ writeSse, id: 'chatcmpl-count', model: 'm', created: 1, intervalMs: 5 });
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    heartbeat.stop();
+
+    assert.ok(heartbeat.beats >= 2, `应发出多次心跳, 实际 ${heartbeat.beats}`);
+    assert.equal(contentChunks, 0, '空增量心跳不得计入内容块数');
+    const frames = parseSseDataFrames(writes);
+    assert.equal(frames.length, heartbeat.beats, '每条心跳对应一条空增量 data 分片');
+    for (const chunk of frames) {
+        assert.deepEqual(chunk.choices[0].delta, {}, '心跳分片都必须是空增量');
+        assert.equal(chunk.choices[0].finish_reason, null);
+    }
+});
+
+test('R6 请求结束心跳停止: stop() 后不再写分片, 终止分片后 isActive=false 自动停', async () => {
+    const { writes, writeSse } = createSseSink();
+    const heartbeat = startStreamHeartbeat({ writeSse, id: 'chatcmpl-stop', model: 'm', created: 1, intervalMs: 5 });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.ok(writes.length > 0, '间隔内应已写出心跳');
+    assert.equal(heartbeat.stop(), true, '首次 stop 生效');
+    assert.equal(heartbeat.stop(), false, 'stop 幂等');
+    const afterStop = writes.length;
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.equal(writes.length, afterStop, 'stop() 后定时器已清理, 不得再写分片');
+
+    /* 终止分片发出后(proxy 的 terminalSent 语义) isActive=false, 定时器自行清理 */
+    const second = createSseSink();
+    let active = true;
+    const hb2 = startStreamHeartbeat({
+        writeSse: second.writeSse,
+        id: 'chatcmpl-term',
+        model: 'm',
+        created: 1,
+        intervalMs: 5,
+        isActive: () => active
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.ok(second.writes.length > 0);
+    active = false;
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(hb2.stopped, true, '终止分片后心跳应自动停止');
+    const countWhenStopped = second.writes.length;
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(second.writes.length, countWhenStopped, '自动停止后不得再写分片');
 });
 
 /* ================================================================== */

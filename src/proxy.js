@@ -39,6 +39,7 @@ import {
     isQueueTimeoutError
 } from './serial-queue.js';
 import { resolveOpencodeLogFile, startOpencodeLogTail } from './opencode-log-tail.js';
+import { DEFAULT_SSE_HEARTBEAT_MS, startStreamHeartbeat } from './stream-heartbeat.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -52,8 +53,11 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 1800000;
 const DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS = 4000;
 /* 工具任务期间可能长时间没有文本增量, 空闲超时从 8s 放宽到 60s, 且工具活动会重置计时 */
 const DEFAULT_EVENT_IDLE_TIMEOUT_MS = 60000;
-/* 流式期间定期发 SSE 注释心跳(: ping), 避免客户端/中间层把长任务当空闲断开 */
-const DEFAULT_SSE_HEARTBEAT_MS = 15000;
+/*
+ * 流式期间的心跳间隔(默认 15s): 每 N 毫秒发一条"空增量"分片(见 src/stream-heartbeat.js)。
+ * 只发 `: ping` 注释不够 —— 注释不产生事件块, 按"取到块才重置计时"的客户端(如 pi-ai
+ * idleWatchdog, 默认 300s)会在长任务中途把连接判成空闲超时。
+ */
 /*
  * 自动批准权限需要注入 opencode 配置的 permission 规则。
  * 注意: opencode 1.19.5 的 `opencode serve` 不支持 `--auto`(传了会打印 help 并 exit 1, 已实测),
@@ -799,11 +803,15 @@ export function createApp(config) {
                 res.setHeader('Content-Type', 'text/event-stream');
                 res.setHeader('Cache-Control', 'no-cache');
                 const id = `chatcmpl-${Date.now()}`;
+                /* 整轮固定的启动时间戳: 内容分片与心跳分片共用, 避免每条分片的 created 都变 */
+                const createdAt = Math.floor(Date.now() / 1000);
                 const filterContentDelta = createToolCallFilter();
                 const filterReasoningDelta = createToolCallFilter();
                 let streamedContent = '';
                 let streamedReasoning = '';
                 let sseChunkCount = 0;
+                /* 是否已写出终止分片(finish_reason=stop): 之后不再发任何空增量心跳 */
+                let terminalSent = false;
 
                 let clientGone = false;
                 res.on('close', () => { clientGone = true; });
@@ -813,14 +821,29 @@ export function createApp(config) {
                     return true;
                 };
 
-                /* 心跳: 长任务期间定期发 SSE 注释(: ping), 避免客户端/中间层把连接当空闲断开。
-                   响应结束/客户端断开/异常路径都会清理, 不依赖业务代码走到固定位置 */
-                const heartbeatId = setInterval(() => {
-                    writeSse(': ping\n\n');
-                }, SSE_HEARTBEAT_MS);
-                if (typeof heartbeatId.unref === 'function') heartbeatId.unref();
-                res.on('finish', () => clearInterval(heartbeatId));
-                res.on('close', () => clearInterval(heartbeatId));
+                /*
+                 * 心跳: 长任务期间(助手完成前没有任何内容增量)每 SSE_HEARTBEAT_MS 写一条合法的
+                 * "空增量"data 分片(前面保留一行 `: ping` 注释), 让客户端能解析出事件并重置空闲计时。
+                 * 只发注释时 pi-ai idleWatchdog(默认 300s)会把连接判成空闲, DSH 在 4 分多就显示"已停止"。
+                 * 终止分片发出 / 响应结束 / 客户端断开都会停掉定时器。
+                 */
+                const heartbeat = startStreamHeartbeat({
+                    writeSse,
+                    id,
+                    model: modelLabel,
+                    created: createdAt,
+                    intervalMs: SSE_HEARTBEAT_MS,
+                    isActive: () => !terminalSent && !clientGone && !res.writableEnded
+                });
+                res.on('finish', () => heartbeat.stop());
+                res.on('close', () => heartbeat.stop());
+
+                /* 终止分片: 先停心跳, 再写 finish_reason=stop, 保证之后不再出现空增量分片 */
+                const sendFinishChunk = () => {
+                    terminalSent = true;
+                    heartbeat.stop();
+                    if (writeSse(`data: ${JSON.stringify({ id, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`)) sseChunkCount++;
+                };
 
                 const sendDelta = (delta, isReasoning = false) => {
                     if (!delta) return;
@@ -834,7 +857,7 @@ export function createApp(config) {
                     const chunk = {
                         id,
                         object: 'chat.completion.chunk',
-                        created: Math.floor(Date.now() / 1000),
+                        created: createdAt,
                         model: modelLabel,
                         choices: [{ index: 0, delta: {}, finish_reason: null }]
                     };
@@ -903,6 +926,8 @@ export function createApp(config) {
                 }
 
                 if (fastFailInfo) {
+                    terminalSent = true;
+                    heartbeat.stop();
                     sendStreamFastFail(writeSse, streamedContent, fastFailInfo, modelLabel);
                     if (!res.writableEnded) res.end();
                     await deleteSessionQuietly(sessionId, reqId);
@@ -914,7 +939,7 @@ export function createApp(config) {
                     const sessionFailure = collected.error || {};
                     const failureText = sessionFailure.data?.message || sessionFailure.message || 'Unknown error';
                     sendDelta(`[Proxy Error] ${sessionFailure.name || 'OpenCodeError'}: ${failureText}`);
-                    if (writeSse(`data: ${JSON.stringify({ id, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`)) sseChunkCount++;
+                    sendFinishChunk();
                     writeSse('data: [DONE]\n\n');
                     if (!res.writableEnded) res.end();
                     logger.warn('[Proxy] Upstream session error', {
@@ -986,6 +1011,8 @@ export function createApp(config) {
                     }
                 } catch (error) {
                     if (isUpstreamRetryError(error)) {
+                        terminalSent = true;
+                        heartbeat.stop();
                         sendStreamFastFail(writeSse, streamedContent, error.info, modelLabel);
                         if (!res.writableEnded) res.end();
                         await deleteSessionQuietly(sessionId, reqId);
@@ -994,7 +1021,7 @@ export function createApp(config) {
                     throw error;
                 }
 
-                if (writeSse(`data: ${JSON.stringify({ id, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`)) sseChunkCount++;
+                sendFinishChunk();
                 writeSse('data: [DONE]\n\n');
                 res.end();
                 logger.info('[Proxy] Request completed', {
@@ -1003,6 +1030,8 @@ export function createApp(config) {
                     model: modelLabel,
                     stream: true,
                     chunks: sseChunkCount,
+                    /* 空增量心跳单独计数: chunks 只统计内容/终止分片, 不被心跳污染 */
+                    heartbeats: heartbeat.beats,
                     contentChars: streamedContent.length,
                     reasoningChars: streamedReasoning.length,
                     echoRemovedChars: (collected && collected.echoRemovedChars) || 0,
